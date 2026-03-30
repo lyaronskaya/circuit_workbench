@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from .model import AttentionPatternExtractor, AVAILABLE_MODELS
 import logging
@@ -41,6 +41,18 @@ class TextRequest(BaseModel):
     text: str
     model_name: Optional[str] = "gpt2-small"
 
+
+class HeadSelection(BaseModel):
+    layer: int
+    head: int
+
+
+class EvaluationRequest(BaseModel):
+    text: str
+    model_name: Optional[str] = "gpt2-small"
+    target_token: Optional[str] = None
+    ablated_heads: List[HeadSelection] = Field(default_factory=list)
+
 @app.post("/process")
 async def process_text(request: TextRequest) -> Dict[str, Any]:
     """Process text and return attention patterns.
@@ -80,6 +92,43 @@ async def process_text(request: TextRequest) -> Dict[str, Any]:
         return result
     except Exception as e:
         logger.error(f"Error processing text: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/evaluate")
+async def evaluate_text(request: EvaluationRequest) -> Dict[str, Any]:
+    model_name = request.model_name
+
+    if model_name not in AVAILABLE_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model_name}' not supported. Available models: {', '.join(AVAILABLE_MODELS.keys())}",
+        )
+
+    if model_name not in model_registry:
+        try:
+            logger.info(f"Loading model '{model_name}'...")
+            model_registry[model_name] = AttentionPatternExtractor(model_name)
+            logger.info(f"Model '{model_name}' loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model '{model_name}': {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to load model '{model_name}': {str(e)}")
+
+    try:
+        logger.info(
+            "Evaluating text with model '%s' and %s ablated heads",
+            model_name,
+            len(request.ablated_heads),
+        )
+        result = model_registry[model_name].evaluate_text(
+            text=request.text,
+            target_token=request.target_token,
+            ablated_heads=[(selection.layer, selection.head) for selection in request.ablated_heads],
+        )
+        result["model_name"] = model_name
+        return result
+    except Exception as e:
+        logger.error(f"Error evaluating text: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/models")

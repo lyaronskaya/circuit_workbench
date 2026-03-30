@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+import html
+from typing import Any, List, Dict, Tuple, Optional
 import json
 import requests
 from dataclasses import dataclass
@@ -151,9 +152,34 @@ class APIService:
             raise Exception(f"API error: {response.text}")
         return response.json()
 
+    def evaluate_text(
+        self,
+        text: str,
+        model: str,
+        target_token: Optional[str],
+        ablated_heads: List[Dict[str, int]]
+    ) -> Dict:
+        response = requests.post(
+            f"{self.base_url}/evaluate",
+            json={
+                "text": text,
+                "model_name": model,
+                "target_token": target_token,
+                "ablated_heads": ablated_heads,
+            },
+            timeout=120
+        )
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()
+
 def get_default_text_for_model(model: str) -> str:
     """Get the default text for a given model from configuration."""
     return MODEL_DEFAULTS.get(model, {}).get("default_text", "")
+
+def get_task_presets_for_model(model: str) -> List[Dict[str, str]]:
+    """Return task presets for a model."""
+    return MODEL_DEFAULTS.get(model, {}).get("task_presets", [])
 
 def create_attention_graph(
     data: Dict,
@@ -273,7 +299,27 @@ def create_attention_graph(
         // Function to get group color
         function getGroupColor(groupId) {{
             const group = headGroups.find(g => g.id === groupId);
-            return group?.color || colorPalette[groupId % colorPalette.length];
+            if (group?.color) {{
+                return group.color;
+            }}
+            return colorPalette[groupId % colorPalette.length];
+        }}
+
+        // Function to get head color
+        function getHeadColor(layer, head) {{
+            // Check if this is a wildcard head (has grey color)
+            const headObj = selectedHeads.find(h => h.layer === layer && h.head === head);
+            if (headObj && headObj.color && headObj.color.startsWith('#')) {{
+                // Check if it's a grey color (all RGB components are equal)
+                const r = parseInt(headObj.color.slice(1, 3), 16);
+                const g = parseInt(headObj.color.slice(3, 5), 16);
+                const b = parseInt(headObj.color.slice(5, 7), 16);
+                if (r === g && g === b) {{
+                    return headObj.color;
+                }}
+            }}
+            // For non-wildcard heads, use the original color palette
+            return individualHeadColorScale(head.toString());
         }}
 
         // Main drawing function
@@ -390,7 +436,7 @@ def create_attention_graph(
                     if (d.groupId >= 0) {{
                         return getGroupColor(d.groupId);
                     }}
-                    return individualHeadColorScale(d.head.toString());
+                    return getHeadColor(d.sourceLayer, d.head);
                 }})
                 .attr("stroke-width", 4)
                 .attr("opacity", 0.6)
@@ -401,8 +447,12 @@ def create_attention_graph(
                         .attr("stroke-width", 6);
                     const tooltip = d3.select("#graph-tooltip");
                     const group = headGroups.find(g => g.id === d.groupId);
+                    const headObj = selectedHeads.find(h => h.layer === d.sourceLayer && h.head === d.head);
+                    const isWildcard = headObj && headObj.color && headObj.color.startsWith('#') && 
+                                     parseInt(headObj.color.slice(1, 3), 16) === parseInt(headObj.color.slice(3, 5), 16) &&
+                                     parseInt(headObj.color.slice(3, 5), 16) === parseInt(headObj.color.slice(5, 7), 16);
                     tooltip.style("display", "block")
-                        .html(`Head: Layer ${{d.source.split("-")[0]}}, Head ${{d.head}}<br>
+                        .html(`Head: Layer ${{d.source.split("-")[0]}}, Head ${{d.head}}${{isWildcard ? ' (Wildcard)' : ''}}<br>
                                Weight: ${{d.weight.toFixed(4)}}${{group ?
                                `<br>Group: ${{group.name}}${{group.description ?
                                `<br><span style="font-style: italic; font-size: 11px;">${{group.description}}</span>` : ''}}` :
@@ -544,12 +594,14 @@ def create_attention_graph(
                     .attr("y", y)
                     .attr("width", 15)
                     .attr("height", 15)
-                    .attr("fill", individualHeadColorScale(head.head.toString()));
+                    .attr("fill", getHeadColor(head.layer, head.head));
                 legend.append("text")
                     .attr("x", 25)
                     .attr("y", y + 12)
                     .attr("font-size", "12px")
-                    .text(`Layer ${{head.layer}}, Head ${{head.head}}`);
+                    .text(`Layer ${{head.layer}}, Head ${{head.head}}${{head.color && head.color.startsWith('#') && 
+                          parseInt(head.color.slice(1, 3), 16) === parseInt(head.color.slice(3, 5), 16) &&
+                          parseInt(head.color.slice(3, 5), 16) === parseInt(head.color.slice(5, 7), 16) ? ' (Wildcard)' : ''}}`);
             }});
         }}
 
@@ -599,6 +651,215 @@ def load_sample_data(model: str) -> Dict:
         st.error("An unexpected error occurred while loading sample data.")
         return None
 
+def get_visible_head_pairs(
+    selected_heads: List[HeadPair],
+    head_groups: List[HeadGroup]
+) -> List[HeadPair]:
+    """Return unique visible heads from manual selection and groups."""
+    visible = {}
+    for head in selected_heads + [head for group in head_groups for head in group.heads]:
+        visible[(head.layer, head.head)] = head
+    return list(visible.values())
+
+def get_filtered_attention_patterns(
+    data: Optional[Dict],
+    threshold: float,
+    selected_heads: List[HeadPair],
+    head_groups: List[HeadGroup]
+) -> List[Dict]:
+    """Return visible attention patterns above threshold."""
+    if not data:
+        return []
+
+    visible_heads = {(head.layer, head.head) for head in get_visible_head_pairs(selected_heads, head_groups)}
+    if not visible_heads:
+        return []
+
+    return [
+        pattern for pattern in data["attentionPatterns"]
+        if pattern["weight"] >= threshold and (pattern["sourceLayer"], pattern["head"]) in visible_heads
+    ]
+
+def summarize_attention_metrics(
+    data: Optional[Dict],
+    threshold: float,
+    selected_heads: List[HeadPair],
+    head_groups: List[HeadGroup]
+) -> Dict[str, Any]:
+    """Build lightweight graph metrics for the workspace panels."""
+    filtered_patterns = get_filtered_attention_patterns(data, threshold, selected_heads, head_groups)
+    visible_heads = get_visible_head_pairs(selected_heads, head_groups)
+    weights = [pattern["weight"] for pattern in filtered_patterns]
+
+    return {
+        "visible_heads": len(visible_heads),
+        "visible_edges": len(filtered_patterns),
+        "max_weight": max(weights) if weights else 0.0,
+        "mean_weight": float(np.mean(weights)) if weights else 0.0,
+        "top_edges": sorted(filtered_patterns, key=lambda pattern: pattern["weight"], reverse=True)[:8]
+    }
+
+def build_head_inspector_options(
+    selected_heads: List[HeadPair],
+    head_groups: List[HeadGroup]
+) -> List[Tuple[str, Tuple[int, int]]]:
+    """Create readable options for inspector selectbox."""
+    options = []
+    seen = set()
+
+    for head in get_visible_head_pairs(selected_heads, head_groups):
+        key = (head.layer, head.head)
+        if key in seen:
+            continue
+        seen.add(key)
+        options.append((f"L{head.layer}H{head.head}", key))
+
+    return sorted(options, key=lambda item: item[1])
+
+def summarize_head_detail(
+    data: Optional[Dict],
+    threshold: float,
+    selected_heads: List[HeadPair],
+    head_groups: List[HeadGroup],
+    head_key: Optional[Tuple[int, int]]
+) -> Optional[Dict[str, Any]]:
+    """Build inspector details for a single visible head."""
+    if not data or head_key is None:
+        return None
+
+    layer, head = head_key
+    filtered_patterns = [
+        pattern for pattern in get_filtered_attention_patterns(data, threshold, selected_heads, head_groups)
+        if pattern["sourceLayer"] == layer and pattern["head"] == head
+    ]
+
+    if not filtered_patterns:
+        return {
+            "layer": layer,
+            "head": head,
+            "group_names": [
+                group.name for group in head_groups
+                if any(group_head.layer == layer and group_head.head == head for group_head in group.heads)
+            ],
+            "top_edges": [],
+            "mean_weight": 0.0
+        }
+
+    group_names = [
+        group.name for group in head_groups
+        if any(group_head.layer == layer and group_head.head == head for group_head in group.heads)
+    ]
+
+    return {
+        "layer": layer,
+        "head": head,
+        "group_names": group_names,
+        "top_edges": sorted(filtered_patterns, key=lambda pattern: pattern["weight"], reverse=True)[:5],
+        "mean_weight": float(np.mean([pattern["weight"] for pattern in filtered_patterns]))
+    }
+
+def render_signal_route_rows(edges: List[Dict], tokens: List[str]) -> str:
+    """Render top routes as compact HTML rows without markdown indentation artifacts."""
+    rows = []
+    for edge in edges:
+        source_token = tokens[edge["sourceToken"]] if edge["sourceToken"] < len(tokens) else f"T{edge['sourceToken']}"
+        dest_token = tokens[edge["destToken"]] if edge["destToken"] < len(tokens) else f"T{edge['destToken']}"
+        rows.append(
+            (
+                '<div class="signal-row">'
+                f'<div class="signal-route">{html.escape(source_token)} -&gt; '
+                f'L{edge["sourceLayer"]}H{edge["head"]} -&gt; {html.escape(dest_token)}</div>'
+                f'<div class="signal-meta">Weight {edge["weight"]:.4f} • '
+                f'source pos {edge["sourceToken"]} • destination pos {edge["destToken"]}</div>'
+                '</div>'
+            )
+        )
+    return '<div class="signal-list">' + "".join(rows) + '</div>'
+
+def render_selected_heads_compact(selected_heads: List[HeadPair], max_visible: int = 48) -> str:
+    """Render a compact summary for large head selections."""
+    if not selected_heads:
+        return ""
+
+    layer_counts: Dict[int, int] = {}
+    for head in selected_heads:
+        layer_counts[head.layer] = layer_counts.get(head.layer, 0) + 1
+
+    summary_html = "".join(
+        f'<span class="selection-summary-chip">L{layer}: {count}</span>'
+        for layer, count in sorted(layer_counts.items())
+    )
+
+    visible_heads = selected_heads[:max_visible]
+    visible_html = "".join(
+        f'<span class="head-button compact-head-chip" style="background-color: {head.color or "#3B82F6"}">{head.layer},{head.head}</span>'
+        for head in visible_heads
+    )
+
+    overflow = len(selected_heads) - len(visible_heads)
+    overflow_html = (
+        f'<span class="selection-overflow-chip">+{overflow} more</span>'
+        if overflow > 0 else ""
+    )
+
+    return (
+        '<div class="compact-selection-card">'
+        f'<div class="compact-selection-meta"><strong>{len(selected_heads)}</strong> selected heads</div>'
+        f'<div class="selection-summary-row">{summary_html}</div>'
+        f'<div class="compact-selection-grid">{visible_html}{overflow_html}</div>'
+        '</div>'
+    )
+
+def get_unique_head_pairs(heads: List[HeadPair]) -> List[HeadPair]:
+    """Deduplicate heads while preserving order."""
+    seen = set()
+    unique_heads = []
+    for head in heads:
+        key = (head.layer, head.head)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_heads.append(head)
+    return unique_heads
+
+def get_ablation_heads(
+    mode: str,
+    selected_heads: List[HeadPair],
+    head_groups: List[HeadGroup],
+    selected_group_name: Optional[str],
+    selected_layer: Optional[int],
+    attention_data: Optional[Dict]
+) -> List[HeadPair]:
+    """Resolve ablation target heads from the chosen UI mode."""
+    if mode == "Selected heads":
+        return get_unique_head_pairs(selected_heads)
+
+    if mode == "Head group" and selected_group_name:
+        for group in head_groups:
+            if group.name == selected_group_name:
+                return get_unique_head_pairs(group.heads)
+        return []
+
+    if mode == "All heads in layer" and selected_layer is not None:
+        num_heads = (attention_data or {}).get("numHeads", 0)
+        if num_heads:
+            return [HeadPair(layer=selected_layer, head=head_index) for head_index in range(num_heads)]
+        layer_heads = [
+            head for head in get_unique_head_pairs(
+                selected_heads + [candidate for group in head_groups for candidate in group.heads]
+            )
+            if head.layer == selected_layer
+        ]
+        return layer_heads
+
+    return []
+
+def format_metric_value(value: Optional[float], precision: int = 4) -> str:
+    """Format scalar metric values for display."""
+    if value is None:
+        return "n/a"
+    return f"{value:.{precision}f}"
+
 def main():
     st.set_page_config(layout="wide", page_title="Information Flow Visualization")
 
@@ -625,20 +886,38 @@ def main():
         st.session_state.color_change_group = None
     if 'curve_type' not in st.session_state:
         st.session_state.curve_type = "cubic"
+    if 'comparison_view' not in st.session_state:
+        st.session_state.comparison_view = "Baseline"
+    if 'inspector_head_key' not in st.session_state:
+        st.session_state.inspector_head_key = None
+    if 'target_token' not in st.session_state:
+        st.session_state.target_token = ""
+    if 'selected_task_preset' not in st.session_state:
+        st.session_state.selected_task_preset = "Custom"
+    if 'evaluation_result' not in st.session_state:
+        st.session_state.evaluation_result = None
+    if 'ablation_mode' not in st.session_state:
+        st.session_state.ablation_mode = "Selected heads"
+    if 'selected_group_for_ablation' not in st.session_state:
+        st.session_state.selected_group_for_ablation = None
+    if 'selected_layer_for_ablation' not in st.session_state:
+        st.session_state.selected_layer_for_ablation = 0
 
     # Custom CSS
     st.markdown("""
         <style>
         .main {
-            padding: 0rem 1rem;
+            padding: 0rem 1.2rem 2rem;
+            background: linear-gradient(180deg, #f6f1e8 0%, #fbfaf6 38%, #f4f6f1 100%);
         }
         .stTitle {
-            font-size: 2rem !important;
-            font-weight: 500 !important;
+            font-size: 2.4rem !important;
+            font-weight: 600 !important;
+            letter-spacing: -0.03em;
         }
         .stSelectbox > div > div {
-            background-color: white;
-            border: 1px solid #e5e7eb;
+            background-color: rgba(255, 252, 246, 0.92);
+            border: 1px solid #d8d4cb;
         }
         .head-button {
             display: inline-block;
@@ -648,12 +927,155 @@ def main():
             font-size: 0.8rem;
             color: white;
         }
-        .group-container {
-            background-color: white;
-            padding: 1rem;
-            border-radius: 8px;
+        .compact-selection-card {
+            background: rgba(243, 239, 228, 0.72);
+            border: 1px solid rgba(95, 86, 66, 0.12);
+            border-radius: 14px;
+            padding: 0.8rem;
+            margin-top: 0.65rem;
+        }
+        .compact-selection-meta {
+            color: #1f2d2d;
+            font-size: 0.9rem;
+            margin-bottom: 0.55rem;
+        }
+        .selection-summary-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin-bottom: 0.65rem;
+        }
+        .selection-summary-chip,
+        .selection-overflow-chip {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 0.2rem 0.55rem;
+            background: rgba(255, 253, 249, 0.92);
+            color: #6a6255;
+            font-size: 0.76rem;
+            border: 1px solid rgba(95, 86, 66, 0.1);
+        }
+        .compact-selection-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.25rem;
+            max-height: 10rem;
+            overflow-y: auto;
+            padding-right: 0.2rem;
+        }
+        .compact-head-chip {
+            margin: 0;
+            font-size: 0.72rem;
+            padding: 0.18rem 0.48rem;
+        }
+        .workspace-shell {
+            background: rgba(255, 251, 245, 0.88);
+            border: 1px solid rgba(95, 86, 66, 0.12);
+            border-radius: 24px;
+            padding: 1.2rem 1.2rem 0.6rem;
+            box-shadow: 0 18px 50px rgba(89, 74, 45, 0.08);
+            backdrop-filter: blur(10px);
+        }
+        .hero-band {
+            padding: 1.4rem 1.5rem;
+            border-radius: 22px;
+            background:
+                radial-gradient(circle at top right, rgba(188, 111, 60, 0.16), transparent 28%),
+                linear-gradient(135deg, #1f2d2d 0%, #31493c 48%, #6d7f44 100%);
+            color: #f9f4ec;
             margin-bottom: 1rem;
-            border: 1px solid #e5e7eb;
+        }
+        .hero-kicker {
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            font-size: 0.72rem;
+            opacity: 0.72;
+            margin-bottom: 0.65rem;
+        }
+        .hero-title {
+            font-size: 2rem;
+            line-height: 1;
+            font-weight: 600;
+            letter-spacing: -0.04em;
+            margin-bottom: 0.55rem;
+        }
+        .hero-copy {
+            max-width: 48rem;
+            font-size: 0.98rem;
+            line-height: 1.6;
+            color: rgba(249, 244, 236, 0.86);
+        }
+        .metric-strip {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.8rem;
+            margin: 0.8rem 0 1rem;
+        }
+        .metric-cell {
+            background: rgba(255, 253, 249, 0.92);
+            border: 1px solid rgba(95, 86, 66, 0.12);
+            border-radius: 18px;
+            padding: 0.9rem 1rem;
+        }
+        .metric-label {
+            color: #6a6255;
+            font-size: 0.76rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            margin-bottom: 0.35rem;
+        }
+        .metric-value {
+            color: #1f2d2d;
+            font-size: 1.55rem;
+            font-weight: 600;
+            letter-spacing: -0.03em;
+        }
+        .panel {
+            background: rgba(255, 253, 249, 0.9);
+            border: 1px solid rgba(95, 86, 66, 0.12);
+            border-radius: 20px;
+            padding: 1rem 1.05rem;
+            min-height: 100%;
+        }
+        .panel-title {
+            color: #1f2d2d;
+            font-size: 0.95rem;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+            margin-bottom: 0.35rem;
+        }
+        .panel-copy {
+            color: #6a6255;
+            font-size: 0.9rem;
+            line-height: 1.55;
+            margin-bottom: 0.8rem;
+        }
+        .signal-list {
+            display: grid;
+            gap: 0.55rem;
+        }
+        .signal-row {
+            background: rgba(243, 239, 228, 0.76);
+            border-radius: 14px;
+            padding: 0.7rem 0.8rem;
+        }
+        .signal-route {
+            color: #1f2d2d;
+            font-size: 0.92rem;
+            font-weight: 600;
+        }
+        .signal-meta {
+            color: #6a6255;
+            font-size: 0.83rem;
+            margin-top: 0.2rem;
+        }
+        .group-container {
+            background-color: rgba(255, 253, 249, 0.95);
+            padding: 1rem;
+            border-radius: 14px;
+            margin-bottom: 1rem;
+            border: 1px solid rgba(95, 86, 66, 0.12);
         }
         .group-description {
             color: #6b7280;
@@ -661,11 +1083,12 @@ def main():
             margin: 0.5rem 0;
         }
         .graph-container {
-            background: white;
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-            padding: 1rem;
+            background: rgba(255, 253, 249, 0.94);
+            border: 1px solid rgba(95, 86, 66, 0.12);
+            border-radius: 24px;
+            padding: 1rem 1rem 0.6rem;
             margin: 1rem 0;
+            box-shadow: 0 10px 30px rgba(89, 74, 45, 0.05);
         }
         .controls-container {
             max-height: 400px;
@@ -730,10 +1153,26 @@ def main():
         div[data-testid="stHorizontalBlock"] > div:first-child button[data-testid="baseButton-primary"]:hover {
             background: #FF3333 !important;
         }
+        @media (max-width: 900px) {
+            .metric-strip {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
         </style>
     """, unsafe_allow_html=True)
 
     st.title("Information Flow Visualization")
+    st.markdown(
+        """
+        <div class="workspace-shell">
+            <div class="hero-band">
+                <div class="hero-kicker">Circuit Workbench</div>
+                <div class="hero-title">Trace hypotheses, inspect head groups, and prepare causal experiments.</div>
+                <div class="hero-copy">The graph remains the main workspace, while the surrounding panels surface the visible signal budget and the next interventions a mechanistic interpretability researcher would want to run.</div>
+            </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     # Model selection
     col1, _ = st.columns([1, 3])
@@ -749,7 +1188,11 @@ def main():
             st.session_state.current_model = selected_model
             st.session_state.head_groups = convert_predefined_groups_to_head_groups(selected_model)
             st.session_state.input_text = get_default_text_for_model(selected_model)
-            st.session_state.attention_data = None  # Reset attention data when switching models
+            st.session_state.attention_data = None
+            st.session_state.evaluation_result = None
+            st.session_state.selected_task_preset = "Custom"
+            presets = get_task_presets_for_model(selected_model)
+            st.session_state.target_token = presets[0]["target_token"] if presets else ""
 
 
     # Backend status and sample data loading
@@ -760,6 +1203,112 @@ def main():
             if st.session_state.attention_data is None:
                 st.error("Failed to load sample data. Please try again later.")
                 return
+
+    preset_definitions = get_task_presets_for_model(st.session_state.current_model)
+    preset_names = ["Custom"] + [preset["name"] for preset in preset_definitions]
+    if st.session_state.selected_task_preset not in preset_names:
+        st.session_state.selected_task_preset = "Custom"
+    if st.session_state.comparison_view not in ["Baseline", "Ablated", "Diff"]:
+        st.session_state.comparison_view = "Baseline"
+
+    task_col, compare_col = st.columns([1.65, 1])
+    with task_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Task Context</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Start from a benchmark-style prompt, then define the target token whose probability should rise or fall when you ablate candidate heads.</div>',
+            unsafe_allow_html=True
+        )
+        selected_preset = st.selectbox(
+            "Task Preset",
+            options=preset_names,
+            index=preset_names.index(st.session_state.selected_task_preset)
+        )
+        if selected_preset != st.session_state.selected_task_preset:
+            st.session_state.selected_task_preset = selected_preset
+            st.session_state.evaluation_result = None
+            if selected_preset != "Custom":
+                preset = next(preset for preset in preset_definitions if preset["name"] == selected_preset)
+                st.session_state.input_text = preset["text"]
+                st.session_state.target_token = preset.get("target_token", "")
+
+        if st.session_state.selected_task_preset != "Custom":
+            active_preset = next(
+                preset for preset in preset_definitions
+                if preset["name"] == st.session_state.selected_task_preset
+            )
+            st.caption(active_preset.get("description", ""))
+
+        st.session_state.target_token = st.text_input(
+            "Target Token",
+            value=st.session_state.target_token,
+            placeholder="e.g. Mary, Paris, gate"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with compare_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Comparison View</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Switch between baseline and ablated analysis once you run a causal evaluation.</div>',
+            unsafe_allow_html=True
+        )
+        st.session_state.comparison_view = st.radio(
+            "View",
+            ["Baseline", "Ablated", "Diff"],
+            index=["Baseline", "Ablated", "Diff"].index(st.session_state.comparison_view),
+            label_visibility="collapsed"
+        )
+        if st.session_state.evaluation_result is None:
+            st.caption("Run Causal Compare to populate baseline vs ablated behavior metrics.")
+        else:
+            st.caption("Use Diff to inspect probability, loss, and top-prediction changes after ablation.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    metrics = summarize_attention_metrics(
+        st.session_state.attention_data,
+        st.session_state.threshold,
+        st.session_state.selected_heads,
+        st.session_state.head_groups
+    )
+    evaluation_result = st.session_state.evaluation_result
+    baseline_metrics = evaluation_result.get("baseline") if evaluation_result else None
+    ablated_metrics = evaluation_result.get("ablated") if evaluation_result else None
+    diff_metrics = evaluation_result.get("delta") if evaluation_result else None
+
+    if st.session_state.comparison_view == "Ablated" and ablated_metrics:
+        metric_label = "Target Probability"
+        metric_value = format_metric_value(ablated_metrics.get("target_probability"))
+    elif st.session_state.comparison_view == "Diff" and diff_metrics:
+        metric_label = "Target Prob Delta"
+        metric_value = format_metric_value(diff_metrics.get("target_probability_delta"))
+    else:
+        metric_label = "Target Probability"
+        metric_value = format_metric_value(baseline_metrics.get("target_probability")) if baseline_metrics else "n/a"
+
+    st.markdown(
+        f"""
+        <div class="metric-strip">
+            <div class="metric-cell">
+                <div class="metric-label">Model</div>
+                <div class="metric-value">{st.session_state.current_model}</div>
+            </div>
+            <div class="metric-cell">
+                <div class="metric-label">Visible Heads</div>
+                <div class="metric-value">{metrics["visible_heads"]}</div>
+            </div>
+            <div class="metric-cell">
+                <div class="metric-label">Visible Edges</div>
+                <div class="metric-value">{metrics["visible_edges"]}</div>
+            </div>
+            <div class="metric-cell">
+                <div class="metric-label">{metric_label}</div>
+                <div class="metric-value">{metric_value}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     # Controls section
     with st.expander("Controls", expanded=True):
@@ -800,7 +1349,7 @@ def main():
                                 </div>
                                 <div class="group-description">{group.description or ''}</div>
                                 <div style="display: flex; flex-wrap: wrap; gap: 4px;">
-                                    {''.join([f'<span class="head-button" style="background-color: {group.color or COLOR_PALETTE[group.id % len(COLOR_PALETTE)]}">{head.layer},{head.head}</span>' for head in group.heads])}
+                                    {''.join([f'<span class="head-button" style="background-color: {group.color or (":,: in group.heads" and get_random_color() or COLOR_PALETTE[group.id % len(COLOR_PALETTE)])}">{head.layer},{head.head}</span>' for head in group.heads])}
                                 </div>
                             </div>
                         """, unsafe_allow_html=True)
@@ -829,6 +1378,10 @@ def main():
             def add_head(head_input: str) -> None:
                 if not head_input.strip():
                     return
+
+                if st.session_state.attention_data is None:
+                    st.error("Load attention data first by processing text or using sample data.")
+                    return
                     
                 try:
                     layer_str, head_str = head_input.split(',')
@@ -838,21 +1391,24 @@ def main():
                     if layer_str == ':' and head_str == ':':
                         for l in range(st.session_state.attention_data['numLayers']):
                             for h in range(st.session_state.attention_data['numHeads']):
-                                st.session_state.selected_heads.append(HeadPair(layer=l, head=h, color="#e5e7eb"))
+                                # Generate a consistent grey color for wildcard heads
+                                grey_value = 128 + ((l * st.session_state.attention_data['numHeads'] + h) * 20) % 96
+                                grey_hex = f"#{grey_value:02x}{grey_value:02x}{grey_value:02x}"
+                                st.session_state.selected_heads.append(HeadPair(layer=l, head=h, color=grey_hex))
                     elif layer_str == ':':
                         head = int(head_str)
                         if not 0 <= head < st.session_state.attention_data['numHeads']:
                             st.error(f"Invalid head number. Must be between 0 and {st.session_state.attention_data['numHeads']-1}")
                             return
                         for l in range(st.session_state.attention_data['numLayers']):
-                            st.session_state.selected_heads.append(HeadPair(layer=l, head=head, color="#e5e7eb"))
+                            st.session_state.selected_heads.append(HeadPair(layer=l, head=head, color=COLOR_PALETTE[head % len(COLOR_PALETTE)]))
                     elif head_str == ':':
                         layer = int(layer_str)
                         if not 0 <= layer < st.session_state.attention_data['numLayers']:
                             st.error(f"Invalid layer number. Must be between 0 and {st.session_state.attention_data['numLayers']-1}")
                             return
                         for h in range(st.session_state.attention_data['numHeads']):
-                            st.session_state.selected_heads.append(HeadPair(layer=layer, head=h, color="#e5e7eb"))
+                            st.session_state.selected_heads.append(HeadPair(layer=layer, head=h, color=COLOR_PALETTE[h % len(COLOR_PALETTE)]))
                     else:
                         layer = int(layer_str)
                         head = int(head_str)
@@ -862,7 +1418,7 @@ def main():
                         if not 0 <= head < st.session_state.attention_data['numHeads']:
                             st.error(f"Invalid head number. Must be between 0 and {st.session_state.attention_data['numHeads']-1}")
                             return
-                        st.session_state.selected_heads.append(HeadPair(layer=layer, head=head, color="#e5e7eb"))
+                        st.session_state.selected_heads.append(HeadPair(layer=layer, head=head, color=COLOR_PALETTE[head % len(COLOR_PALETTE)]))
                     
                     # Clear the input field after successful addition
                     st.session_state.head_input_value = ""
@@ -882,25 +1438,38 @@ def main():
 
             # Display selected heads
             if st.session_state.selected_heads:
-                for head in st.session_state.selected_heads:
-                    col1, col2, col3 = st.columns([5, 1, 1])
-                    with col1:
-                        st.markdown(f"""
-                            <div style="display: flex; align-items: center; gap: 4px;">
-                                <span class="head-button" style="background-color: {head.color or '#3B82F6'}">
-                                    {head.layer},{head.head}
-                                </span>
-                            </div>
-                        """, unsafe_allow_html=True)
+                compact_mode = len(st.session_state.selected_heads) > 24
+                if compact_mode:
+                    action_col1, action_col2 = st.columns([1, 4])
+                    with action_col1:
+                        if st.button("Clear all", key="clear_all_heads"):
+                            st.session_state.selected_heads = []
+                    with action_col2:
+                        st.caption("Compact mode is enabled automatically for large selections.")
+                    st.markdown(
+                        render_selected_heads_compact(st.session_state.selected_heads),
+                        unsafe_allow_html=True
+                    )
+                else:
+                    for head in st.session_state.selected_heads:
+                        col1, col2, col3 = st.columns([5, 1, 1])
+                        with col1:
+                            st.markdown(f"""
+                                <div style="display: flex; align-items: center; gap: 4px;">
+                                    <span class="head-button" style="background-color: {head.color or '#3B82F6'}">
+                                        {head.layer},{head.head}
+                                    </span>
+                                </div>
+                            """, unsafe_allow_html=True)
 
-                    with col2:
-                        if st.button("🎨", key=f"color_head_{head.layer}_{head.head}", help="Change head color"):
-                            head.color = get_random_color()
+                        with col2:
+                            if st.button("🎨", key=f"color_head_{head.layer}_{head.head}", help="Change head color"):
+                                head.color = get_random_color()
 
-                    with col3:
-                        if st.button("×", key=f"remove_{head.layer}_{head.head}", help="Remove head"):
-                            st.session_state.selected_heads = [h for h in st.session_state.selected_heads 
-                                                             if not (h.layer == head.layer and h.head == head.head)]
+                        with col3:
+                            if st.button("×", key=f"remove_{head.layer}_{head.head}", help="Remove head"):
+                                st.session_state.selected_heads = [h for h in st.session_state.selected_heads 
+                                                                 if not (h.layer == head.layer and h.head == head.head)]
         
         st.markdown('</div>', unsafe_allow_html=True)  # Close controls container
 
@@ -952,6 +1521,7 @@ def main():
                         st.session_state.input_text,
                         st.session_state.current_model
                     )
+                    st.session_state.evaluation_result = None
                 except Exception as e:
                     st.error(f"Error processing text: {str(e)}")
                 finally:
@@ -963,6 +1533,205 @@ def main():
             disabled=True,
             help="Text input is disabled when using sample data. Please start the backend server to enable text processing."
         )
+
+    insight_col, intervention_col = st.columns([1.45, 1])
+    with insight_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Signal Routes</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">These are the strongest currently visible edges after your threshold and head filters. They help you decide what subgraph deserves the next causal test.</div>',
+            unsafe_allow_html=True
+        )
+        if metrics["top_edges"]:
+            tokens = (st.session_state.attention_data or {}).get("tokens", [])
+            st.markdown(render_signal_route_rows(metrics["top_edges"][:5], tokens), unsafe_allow_html=True)
+        else:
+            st.info("No visible edges yet. Lower the threshold or add a head/group to start tracing routes.")
+        st.markdown('</div>', unsafe_allow_html=True)
+    with intervention_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Intervention Workspace</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Choose which heads to ablate, then compare baseline and ablated behavior on the selected target token.</div>',
+            unsafe_allow_html=True
+        )
+        intervention_target = st.selectbox(
+            "Intervention Target",
+            ["Selected heads", "Head group", "All heads in layer"],
+            index=["Selected heads", "Head group", "All heads in layer"].index(st.session_state.ablation_mode)
+        )
+        st.session_state.ablation_mode = intervention_target
+
+        ablation_group_name = None
+        ablation_layer = None
+        if intervention_target == "Head group":
+            group_names = [group.name for group in st.session_state.head_groups]
+            if group_names:
+                if st.session_state.selected_group_for_ablation not in group_names:
+                    st.session_state.selected_group_for_ablation = group_names[0]
+                ablation_group_name = st.selectbox(
+                    "Group",
+                    options=group_names,
+                    index=group_names.index(st.session_state.selected_group_for_ablation)
+                )
+                st.session_state.selected_group_for_ablation = ablation_group_name
+            else:
+                st.info("No head groups are available yet.")
+        elif intervention_target == "All heads in layer":
+            max_source_layer = max((st.session_state.attention_data or {}).get("numLayers", 1) - 1, 0)
+            layer_options = list(range(max_source_layer))
+            if layer_options:
+                if st.session_state.selected_layer_for_ablation not in layer_options:
+                    st.session_state.selected_layer_for_ablation = layer_options[0]
+                ablation_layer = st.selectbox(
+                    "Layer",
+                    options=layer_options,
+                    index=layer_options.index(st.session_state.selected_layer_for_ablation)
+                )
+                st.session_state.selected_layer_for_ablation = ablation_layer
+
+        ablation_heads = get_ablation_heads(
+            intervention_target,
+            st.session_state.selected_heads,
+            st.session_state.head_groups,
+            ablation_group_name,
+            ablation_layer,
+            st.session_state.attention_data,
+        )
+        st.caption(f"Ablation set size: {len(ablation_heads)} heads")
+
+        compare_disabled = (not st.session_state.backend_available) or (len(ablation_heads) == 0)
+        if st.button("Run Causal Compare", type="primary", disabled=compare_disabled):
+            try:
+                st.session_state.evaluation_result = st.session_state.api_service.evaluate_text(
+                    text=st.session_state.input_text,
+                    model=st.session_state.current_model,
+                    target_token=st.session_state.target_token,
+                    ablated_heads=[{"layer": head.layer, "head": head.head} for head in ablation_heads],
+                )
+                if st.session_state.attention_data is None:
+                    st.session_state.attention_data = st.session_state.api_service.process_text(
+                        st.session_state.input_text,
+                        st.session_state.current_model
+                    )
+            except Exception as e:
+                st.error(f"Error running causal compare: {str(e)}")
+
+        if not st.session_state.backend_available:
+            st.caption("Causal compare requires a live backend.")
+        elif len(ablation_heads) == 0:
+            st.caption("Select at least one head, group, or layer before running ablation.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if evaluation_result:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Causal Comparison</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Baseline and ablated metrics for the current prompt. Use the delta values to decide whether the chosen heads are plausibly causal for the target behavior.</div>',
+            unsafe_allow_html=True
+        )
+        comparison_rows = [
+            {
+                "Metric": "Top prediction",
+                "Baseline": baseline_metrics.get("top_prediction") if baseline_metrics else "n/a",
+                "Ablated": ablated_metrics.get("top_prediction") if ablated_metrics else "n/a",
+                "Diff": "changed" if diff_metrics and diff_metrics.get("top_prediction_changed") else "unchanged",
+            },
+            {
+                "Metric": "Target probability",
+                "Baseline": format_metric_value(baseline_metrics.get("target_probability")) if baseline_metrics else "n/a",
+                "Ablated": format_metric_value(ablated_metrics.get("target_probability")) if ablated_metrics else "n/a",
+                "Diff": format_metric_value(diff_metrics.get("target_probability_delta")) if diff_metrics else "n/a",
+            },
+            {
+                "Metric": "Logit diff",
+                "Baseline": format_metric_value(baseline_metrics.get("logit_diff")) if baseline_metrics else "n/a",
+                "Ablated": format_metric_value(ablated_metrics.get("logit_diff")) if ablated_metrics else "n/a",
+                "Diff": format_metric_value(diff_metrics.get("logit_diff_delta")) if diff_metrics else "n/a",
+            },
+            {
+                "Metric": "Loss",
+                "Baseline": format_metric_value(baseline_metrics.get("loss")) if baseline_metrics else "n/a",
+                "Ablated": format_metric_value(ablated_metrics.get("loss")) if ablated_metrics else "n/a",
+                "Diff": format_metric_value(diff_metrics.get("loss_delta")) if diff_metrics else "n/a",
+            },
+        ]
+        st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
+        top_tokens = (
+            baseline_metrics.get("top_tokens", [])
+            if st.session_state.comparison_view == "Baseline" or not ablated_metrics
+            else ablated_metrics.get("top_tokens", [])
+        )
+        if top_tokens:
+            st.caption("Top continuation candidates in the active comparison view")
+            st.dataframe(pd.DataFrame(top_tokens), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    inspector_options = build_head_inspector_options(
+        st.session_state.selected_heads,
+        st.session_state.head_groups
+    )
+    if inspector_options:
+        valid_keys = [option[1] for option in inspector_options]
+        if st.session_state.inspector_head_key not in valid_keys:
+            st.session_state.inspector_head_key = valid_keys[0]
+
+    inspector_col, hypothesis_col = st.columns([1.05, 1.2])
+    with inspector_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Head Inspector</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Inspect one visible head at a time to connect graph structure with a concrete candidate mechanism.</div>',
+            unsafe_allow_html=True
+        )
+        if inspector_options:
+            option_map = {label: key for label, key in inspector_options}
+            selected_label = st.selectbox(
+                "Inspect Head",
+                options=list(option_map.keys()),
+                index=list(option_map.values()).index(st.session_state.inspector_head_key)
+            )
+            st.session_state.inspector_head_key = option_map[selected_label]
+            head_summary = summarize_head_detail(
+                st.session_state.attention_data,
+                st.session_state.threshold,
+                st.session_state.selected_heads,
+                st.session_state.head_groups,
+                st.session_state.inspector_head_key
+            )
+            if head_summary:
+                group_label = ", ".join(head_summary["group_names"]) if head_summary["group_names"] else "Independent selection"
+                st.markdown(f"**Group context:** {group_label}")
+                st.markdown(f"**Mean visible weight:** {head_summary['mean_weight']:.4f}")
+                if head_summary["top_edges"]:
+                    for edge in head_summary["top_edges"]:
+                        tokens = (st.session_state.attention_data or {}).get("tokens", [])
+                        source_token = tokens[edge["sourceToken"]] if edge["sourceToken"] < len(tokens) else f"T{edge['sourceToken']}"
+                        dest_token = tokens[edge["destToken"]] if edge["destToken"] < len(tokens) else f"T{edge['destToken']}"
+                        st.caption(
+                            f"{source_token} -> {dest_token} via L{edge['sourceLayer']}H{edge['head']} • {edge['weight']:.4f}"
+                        )
+                else:
+                    st.caption("No visible edges for this head at the current threshold.")
+        else:
+            st.info("Add an individual head or keep a predefined group visible to activate the inspector.")
+        st.markdown('</div>', unsafe_allow_html=True)
+    with hypothesis_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Hypothesis Checklist</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">A compact research checklist keeps the graph anchored to mechanistic questions instead of turning into an attention tour.</div>',
+            unsafe_allow_html=True
+        )
+        checklist_items = [
+            "Which source token appears to feed the answer-relevant position?",
+            "Does the candidate route stay stable when you raise the threshold?",
+            "Which selected head looks redundant or backup-like?",
+            "What is the next ablation or patching test you would run?"
+        ]
+        for item in checklist_items:
+            st.checkbox(item, value=False, key=f"checklist_{item}")
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # Visualization
     if st.session_state.attention_data:
