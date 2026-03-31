@@ -28,15 +28,6 @@ app.add_middleware(
 # Create a model registry to hold model instances
 model_registry = {}
 
-# Initialize default model
-try:
-    default_model_name = "gpt2-small"
-    model_registry[default_model_name] = AttentionPatternExtractor(default_model_name)
-    logger.info(f"Default model '{default_model_name}' initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize default model: {str(e)}")
-    raise
-
 class TextRequest(BaseModel):
     text: str
     model_name: Optional[str] = "gpt2-small"
@@ -52,6 +43,26 @@ class EvaluationRequest(BaseModel):
     model_name: Optional[str] = "gpt2-small"
     target_token: Optional[str] = None
     ablated_heads: List[HeadSelection] = Field(default_factory=list)
+
+
+def get_or_load_model(model_name: str) -> AttentionPatternExtractor:
+    """Load a model on demand so the API can bind its port before heavy startup work."""
+    if model_name not in AVAILABLE_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model_name}' not supported. Available models: {', '.join(AVAILABLE_MODELS.keys())}",
+        )
+
+    if model_name not in model_registry:
+        try:
+            logger.info(f"Loading model '{model_name}'...")
+            model_registry[model_name] = AttentionPatternExtractor(model_name)
+            logger.info(f"Model '{model_name}' loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model '{model_name}': {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to load model '{model_name}': {str(e)}")
+
+    return model_registry[model_name]
 
 @app.post("/process")
 async def process_text(request: TextRequest) -> Dict[str, Any]:
@@ -70,23 +81,11 @@ async def process_text(request: TextRequest) -> Dict[str, Any]:
     """
     model_name = request.model_name
     
-    # Validate model name
-    if model_name not in AVAILABLE_MODELS:
-        raise HTTPException(status_code=400, detail=f"Model '{model_name}' not supported. Available models: {', '.join(AVAILABLE_MODELS.keys())}")
-    
-    # Load model if not already loaded
-    if model_name not in model_registry:
-        try:
-            logger.info(f"Loading model '{model_name}'...")
-            model_registry[model_name] = AttentionPatternExtractor(model_name)
-            logger.info(f"Model '{model_name}' loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load model '{model_name}': {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to load model '{model_name}': {str(e)}")
+    model = get_or_load_model(model_name)
     
     try:
         logger.info(f"Processing text with model '{model_name}': {request.text[:50]}...")
-        result = model_registry[model_name].process_text(request.text)
+        result = model.process_text(request.text)
         result["model_name"] = model_name  # Add model name to response
         logger.info(f"Successfully processed text. Generated {len(result['attentionPatterns'])} patterns")
         return result
@@ -99,20 +98,7 @@ async def process_text(request: TextRequest) -> Dict[str, Any]:
 async def evaluate_text(request: EvaluationRequest) -> Dict[str, Any]:
     model_name = request.model_name
 
-    if model_name not in AVAILABLE_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model '{model_name}' not supported. Available models: {', '.join(AVAILABLE_MODELS.keys())}",
-        )
-
-    if model_name not in model_registry:
-        try:
-            logger.info(f"Loading model '{model_name}'...")
-            model_registry[model_name] = AttentionPatternExtractor(model_name)
-            logger.info(f"Model '{model_name}' loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load model '{model_name}': {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to load model '{model_name}': {str(e)}")
+    model = get_or_load_model(model_name)
 
     try:
         logger.info(
@@ -120,7 +106,7 @@ async def evaluate_text(request: EvaluationRequest) -> Dict[str, Any]:
             model_name,
             len(request.ablated_heads),
         )
-        result = model_registry[model_name].evaluate_text(
+        result = model.evaluate_text(
             text=request.text,
             target_token=request.target_token,
             ablated_heads=[(selection.layer, selection.head) for selection in request.ablated_heads],
