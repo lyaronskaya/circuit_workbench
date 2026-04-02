@@ -2,12 +2,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
-from .model import AttentionPatternExtractor, AVAILABLE_MODELS
 import logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+AVAILABLE_MODELS = {
+    "gpt2-small": "gpt2-small",
+    "pythia-2.8b": "pythia-2.8b",
+}
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -45,7 +49,7 @@ class EvaluationRequest(BaseModel):
     ablated_heads: List[HeadSelection] = Field(default_factory=list)
 
 
-def get_or_load_model(model_name: str) -> AttentionPatternExtractor:
+def get_or_load_model(model_name: str):
     """Load a model on demand so the API can bind its port before heavy startup work."""
     if model_name not in AVAILABLE_MODELS:
         raise HTTPException(
@@ -55,6 +59,8 @@ def get_or_load_model(model_name: str) -> AttentionPatternExtractor:
 
     if model_name not in model_registry:
         try:
+            from .model import AttentionPatternExtractor
+
             logger.info(f"Loading model '{model_name}'...")
             model_registry[model_name] = AttentionPatternExtractor(model_name)
             logger.info(f"Model '{model_name}' loaded successfully")
@@ -123,6 +129,14 @@ async def list_models():
     return {
         "models": list(AVAILABLE_MODELS.keys()),
         "loaded_models": list(model_registry.keys())
+    }
+
+@app.get("/")
+async def root():
+    """Minimal root endpoint for platform health checks."""
+    return {
+        "status": "ok",
+        "service": "attention-api",
     }
 
 @app.get("/health")
