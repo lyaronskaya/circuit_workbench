@@ -50,7 +50,8 @@ def generate_sample_data(output_dir=None):
             
             print(f"✅ Sample attention patterns saved to {output_path}")
             print(f"   Number of tokens: {result['numTokens']}")
-            print(f"   Number of attention patterns: {len(result['attentionPatterns'])}")
+            print(f"   Number of grouped heads: {len(result['attentionHeads'])}")
+            print(f"   Number of attention edges: {result['numEdges']}")
             print(f"   Tokens: {result['tokens']}")
         except Exception as e:
             print(f"❌ Error generating sample data for {model_name}: {e}")

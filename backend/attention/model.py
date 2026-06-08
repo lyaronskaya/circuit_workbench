@@ -1,4 +1,3 @@
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -56,35 +55,79 @@ class AttentionPatternExtractor:
             "patterns": patterns,
         }
 
-    def process_text(self, text: str) -> Dict[str, Any]:
+    def _build_sparse_attention_heads(
+        self,
+        patterns: List[np.ndarray],
+        num_tokens: int,
+        threshold: float,
+        top_k: int,
+        selected_heads: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        if selected_heads is not None and len(selected_heads) == 0:
+            return [], 0
+
+        visible_heads = set(selected_heads or [])
+        use_all_heads = selected_heads is None
+        attention_heads: List[Dict[str, Any]] = []
+        total_edges = 0
+
+        for layer, layer_pattern in enumerate(patterns):
+            for head in range(self.n_heads):
+                if not use_all_heads and (layer, head) not in visible_heads:
+                    continue
+
+                head_pattern = layer_pattern[head]
+                candidate_edges: List[Tuple[int, int, float]] = []
+                for dest_idx in range(num_tokens):
+                    for src_idx in range(num_tokens):
+                        weight = float(head_pattern[dest_idx, src_idx])
+                        if weight >= threshold:
+                            candidate_edges.append((src_idx, dest_idx, weight))
+
+                if not candidate_edges:
+                    continue
+
+                candidate_edges.sort(key=lambda edge: edge[2], reverse=True)
+                limited_edges = candidate_edges[:top_k]
+                total_edges += len(limited_edges)
+                attention_heads.append(
+                    {
+                        "layer": layer,
+                        "head": head,
+                        "edges": [[src_idx, dest_idx, weight] for src_idx, dest_idx, weight in limited_edges],
+                    }
+                )
+
+        return attention_heads, total_edges
+
+    def process_text(
+        self,
+        text: str,
+        threshold: float = 0.4,
+        top_k: int = 12,
+        selected_heads: Optional[List[Tuple[int, int]]] = None,
+    ) -> Dict[str, Any]:
         result = self.get_attention_patterns(text)
         tokens = result["tokens"]
         patterns = result["patterns"]
-
-        attention_patterns: List[Dict[str, Any]] = []
-        for layer, layer_pattern in enumerate(patterns):
-            for head in range(self.n_heads):
-                head_pattern = layer_pattern[head]
-                for src_idx in range(len(tokens)):
-                    for dest_idx in range(len(tokens)):
-                        weight = float(head_pattern[dest_idx, src_idx])
-                        attention_patterns.append(
-                            {
-                                "sourceLayer": layer,
-                                "sourceToken": src_idx,
-                                "destLayer": layer + 1,
-                                "destToken": dest_idx,
-                                "weight": weight,
-                                "head": head,
-                            }
-                        )
+        attention_heads, total_edges = self._build_sparse_attention_heads(
+            patterns=patterns,
+            num_tokens=len(tokens),
+            threshold=threshold,
+            top_k=top_k,
+            selected_heads=selected_heads,
+        )
 
         return {
             "numLayers": self.n_layers + 1,
             "numTokens": len(tokens),
             "numHeads": self.n_heads,
             "tokens": tokens,
-            "attentionPatterns": attention_patterns,
+            "attentionFormat": "grouped_sparse_v1",
+            "attentionHeads": attention_heads,
+            "numEdges": total_edges,
+            "threshold": threshold,
+            "top_k": top_k,
             "model_name": self.model_name,
             "model_info": {
                 "name": self.model_name,
@@ -101,6 +144,11 @@ class AttentionPatternExtractor:
         if candidates.numel() == 0:
             return None
         return int(candidates[0].item())
+
+    def _top_non_target_token_id(self, logits: torch.Tensor, target_token_id: int) -> int:
+        competitor_logits = logits.clone()
+        competitor_logits[target_token_id] = float("-inf")
+        return int(torch.argmax(competitor_logits).item())
 
     def _head_ablation_hook(self, ablated_heads: set[Tuple[int, int]]):
         def hook_fn(z, hook):
@@ -142,7 +190,8 @@ class AttentionPatternExtractor:
         logits: torch.Tensor,
         tokens: torch.Tensor,
         target_token_id: Optional[int],
-        baseline_target_logit: Optional[float] = None,
+        baseline_logit_diff: Optional[float] = None,
+        baseline_target_rank: Optional[int] = None,
     ) -> Dict[str, Any]:
         final_logits = logits[0, -1]
         probs = F.softmax(final_logits, dim=-1)
@@ -151,9 +200,23 @@ class AttentionPatternExtractor:
 
         target_prob = None
         target_logit = None
+        target_rank = None
+        logit_diff = None
         if target_token_id is not None:
             target_prob = float(probs[target_token_id].item())
             target_logit = float(final_logits[target_token_id].item())
+            higher_logits = int((final_logits > final_logits[target_token_id]).sum().item())
+            target_rank = higher_logits + 1
+
+            if int(top_id.item()) == target_token_id:
+                competitor_values, competitor_indices = torch.topk(final_logits, k=min(2, final_logits.shape[0]))
+                competitor_logit = (
+                    float(competitor_values[1].item())
+                    if competitor_values.shape[0] > 1 else float(competitor_values[0].item())
+                )
+            else:
+                competitor_logit = float(final_logits[top_id].item())
+            logit_diff = target_logit - competitor_logit
 
         metrics: Dict[str, Any] = {
             "top_prediction": top_token,
@@ -162,20 +225,19 @@ class AttentionPatternExtractor:
             "target_token_id": target_token_id,
             "target_probability": target_prob,
             "target_logit": target_logit,
+            "target_rank": target_rank,
+            "logit_diff": logit_diff,
         }
 
-        if baseline_target_logit is not None and target_logit is not None:
-            top_logit = float(final_logits[top_id].item())
-            metrics["logit_diff"] = target_logit - top_logit
-            metrics["logit_diff_delta"] = target_logit - baseline_target_logit
-        elif target_logit is not None:
-            competitor_index = int(torch.topk(final_logits, k=2).indices[1].item()) if final_logits.shape[0] > 1 else int(top_id.item())
-            competitor_logit = float(final_logits[competitor_index].item())
-            metrics["logit_diff"] = target_logit - competitor_logit
-            metrics["logit_diff_delta"] = 0.0
+        if baseline_logit_diff is not None and logit_diff is not None:
+            metrics["logit_diff_delta"] = logit_diff - baseline_logit_diff
         else:
-            metrics["logit_diff"] = None
-            metrics["logit_diff_delta"] = None
+            metrics["logit_diff_delta"] = 0.0 if logit_diff is not None else None
+
+        if baseline_target_rank is not None and target_rank is not None:
+            metrics["target_rank_delta"] = target_rank - baseline_target_rank
+        else:
+            metrics["target_rank_delta"] = 0 if target_rank is not None else None
 
         top_k = torch.topk(probs, k=min(5, probs.shape[0]))
         metrics["top_tokens"] = [
@@ -215,7 +277,8 @@ class AttentionPatternExtractor:
                 ablated_logits,
                 token_tensor,
                 target_token_id,
-                baseline_target_logit=baseline_metrics["target_logit"],
+                baseline_logit_diff=baseline_metrics["logit_diff"],
+                baseline_target_rank=baseline_metrics["target_rank"],
             )
             result["ablated"] = ablated_metrics
             result["delta"] = {
@@ -226,10 +289,175 @@ class AttentionPatternExtractor:
                 ),
                 "loss_delta": ablated_metrics["loss"] - baseline_metrics["loss"],
                 "logit_diff_delta": ablated_metrics["logit_diff_delta"],
+                "target_rank_delta": ablated_metrics["target_rank_delta"],
                 "top_prediction_changed": ablated_metrics["top_prediction"] != baseline_metrics["top_prediction"],
             }
 
         return result
+
+    def build_max_logit_diff_graph(
+        self,
+        text: str,
+        corrupted_text: str,
+        target_token: Optional[str] = None,
+        top_k: int = 12,
+        top_heads_per_layer: int = 3,
+        selected_heads: Optional[List[Tuple[int, int]]] = None,
+    ) -> Dict[str, Any]:
+        clean_visible_tokens = self.model.to_str_tokens(text)[1:]
+        corrupted_visible_tokens = self.model.to_str_tokens(corrupted_text)[1:]
+
+        if len(clean_visible_tokens) != len(corrupted_visible_tokens):
+            raise ValueError("Clean and corrupted prompts must tokenize to the same visible token length.")
+
+        clean_tokens = self.model.to_tokens(text)
+        corrupted_tokens = self.model.to_tokens(corrupted_text)
+        position = len(clean_visible_tokens) - 1
+        model_position = position + 1
+
+        if model_position >= clean_tokens.shape[1] or model_position >= corrupted_tokens.shape[1]:
+            raise ValueError("Selected position is outside the model token range.")
+
+        target_token_id = self._resolve_target_token_id(target_token)
+        if target_token_id is None:
+            raise ValueError("Target token is required when analyzing the final visible position.")
+
+        pattern_names = {f"blocks.{layer}.attn.hook_pattern" for layer in range(self.n_layers)}
+        z_names = {f"blocks.{layer}.attn.hook_z" for layer in range(self.n_layers)}
+        cache_names = lambda name: name in pattern_names or name in z_names
+
+        clean_logits, clean_cache = self.model.run_with_cache(
+            text,
+            return_type="logits",
+            names_filter=cache_names,
+        )
+        corrupted_logits, corrupted_cache = self.model.run_with_cache(
+            corrupted_text,
+            return_type="logits",
+            names_filter=cache_names,
+        )
+
+        prediction_index = model_position
+        clean_final_logits = clean_logits[0, prediction_index]
+        corrupted_final_logits = corrupted_logits[0, prediction_index]
+        clean_competitor_id = self._top_non_target_token_id(clean_final_logits, target_token_id)
+        corrupted_competitor_id = self._top_non_target_token_id(corrupted_final_logits, target_token_id)
+
+        clean_direction = self.model.W_U[:, target_token_id] - self.model.W_U[:, clean_competitor_id]
+        corrupted_direction = self.model.W_U[:, target_token_id] - self.model.W_U[:, corrupted_competitor_id]
+
+        visible_heads_by_layer: Dict[int, set[int]] = {}
+        if selected_heads:
+            for candidate_layer, head in selected_heads:
+                visible_heads_by_layer.setdefault(candidate_layer, set()).add(head)
+
+        all_head_scores: List[Dict[str, Any]] = []
+        important_nodes: List[Dict[str, Any]] = []
+        edges: List[Dict[str, Any]] = []
+
+        for layer in range(self.n_layers):
+            pattern_name = f"blocks.{layer}.attn.hook_pattern"
+            z_name = f"blocks.{layer}.attn.hook_z"
+            clean_patterns = clean_cache[pattern_name][0]
+            clean_z = clean_cache[z_name][0]
+            corrupted_z = corrupted_cache[z_name][0]
+            layer_w_o = self.model.W_O[layer]
+            clean_results = torch.einsum("phd,hdm->phm", clean_z, layer_w_o)
+            corrupted_results = torch.einsum("phd,hdm->phm", corrupted_z, layer_w_o)
+
+            allowed_heads = visible_heads_by_layer.get(layer)
+            use_all_heads = allowed_heads is None
+
+            head_scores: List[Dict[str, Any]] = []
+            for head in range(self.n_heads):
+                if not use_all_heads and head not in allowed_heads:
+                    continue
+
+                clean_result = clean_results[model_position, head, :]
+                corrupted_result = corrupted_results[model_position, head, :]
+                clean_contribution = float(torch.dot(clean_result, clean_direction).item())
+                corrupted_contribution = float(torch.dot(corrupted_result, corrupted_direction).item())
+                head_scores.append(
+                    {
+                        "layer": layer,
+                        "head": head,
+                        "clean_logit_diff": clean_contribution,
+                        "corrupted_logit_diff": corrupted_contribution,
+                        "logit_diff_delta": clean_contribution - corrupted_contribution,
+                    }
+                )
+
+            if not head_scores:
+                continue
+
+            all_head_scores.extend(head_scores)
+            layer_important_heads = sorted(
+                head_scores,
+                key=lambda item: item["logit_diff_delta"],
+                reverse=True,
+            )[:top_heads_per_layer]
+
+            for rank, important_head in enumerate(layer_important_heads):
+                head_index = important_head["head"]
+                attention_row = clean_patterns[head_index, model_position, 1:].detach().cpu().numpy()
+                important_nodes.append(
+                    {
+                        "layer": layer + 1,
+                        "token": position,
+                        "sourceLayer": layer,
+                        "head": head_index,
+                        "rankInLayer": rank,
+                        "logit_diff_delta": float(important_head["logit_diff_delta"]),
+                        "clean_logit_diff": float(important_head["clean_logit_diff"]),
+                        "corrupted_logit_diff": float(important_head["corrupted_logit_diff"]),
+                        "clean_competitor": self.model.to_string(
+                            torch.tensor([clean_competitor_id], device=self.device)
+                        ),
+                        "corrupted_competitor": self.model.to_string(
+                            torch.tensor([corrupted_competitor_id], device=self.device)
+                        ),
+                    }
+                )
+
+                candidate_edges: List[Dict[str, Any]] = []
+                for source_token, attention_weight in enumerate(attention_row.tolist()):
+                    combined_score = float(attention_weight) * float(important_head["logit_diff_delta"])
+                    candidate_edges.append(
+                        {
+                            "sourceLayer": layer,
+                            "sourceToken": source_token,
+                            "destToken": position,
+                            "weight": float(attention_weight),
+                            "head": head_index,
+                            "rankInLayer": rank,
+                            "logit_diff_delta": float(important_head["logit_diff_delta"]),
+                            "clean_logit_diff": float(important_head["clean_logit_diff"]),
+                            "corrupted_logit_diff": float(important_head["corrupted_logit_diff"]),
+                            "combined_score": combined_score,
+                        }
+                    )
+
+                candidate_edges.sort(key=lambda edge: abs(edge["combined_score"]), reverse=True)
+                edges.extend(candidate_edges[:top_k])
+
+        if not important_nodes:
+            raise ValueError("No heads are available under the current filter.")
+
+        return {
+            "graphMode": "max_logit_diff_all_layers_last_position",
+            "numLayers": self.n_layers + 1,
+            "numTokens": len(clean_visible_tokens),
+            "numHeads": self.n_heads,
+            "tokens": clean_visible_tokens,
+            "selectedPosition": position,
+            "targetToken": self.model.to_string(torch.tensor([target_token_id], device=self.device)),
+            "targetTokenId": target_token_id,
+            "topHeadsPerLayer": top_heads_per_layer,
+            "importantNodes": important_nodes,
+            "headScores": all_head_scores,
+            "attentionPatterns": edges,
+            "numEdges": len(edges),
+        }
 
 
 if __name__ == "__main__":
@@ -237,5 +465,6 @@ if __name__ == "__main__":
     text = "The quick brown fox jumped over the lazy dog"
     patterns = extractor.process_text(text)
     print(f"Number of tokens: {patterns['numTokens']}")
-    print(f"Number of attention patterns: {len(patterns['attentionPatterns'])}")
+    print(f"Number of grouped heads: {len(patterns['attentionHeads'])}")
+    print(f"Number of attention edges: {patterns['numEdges']}")
     print(f"Tokens: {patterns['tokens']}")

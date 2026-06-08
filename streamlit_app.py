@@ -10,6 +10,7 @@ from datetime import datetime
 import logging
 import io
 import os
+from pathlib import Path
 import plotly.graph_objects as go
 from config.model_groups import MODEL_SPECIFIC_GROUPS
 from config.model_defaults import MODEL_DEFAULTS
@@ -56,6 +57,11 @@ COLOR_PALETTE = [
     "#731DD8",  # Electric Purple
 ]
 
+MODEL_INFO = {
+    "gpt2-small": {"layers": 12, "heads": 12},
+    "pythia-2.8b": {"layers": 32, "heads": 32},
+}
+
 def get_random_color() -> str:
     """Get a random color from the palette."""
     return COLOR_PALETTE[np.random.randint(0, len(COLOR_PALETTE))]
@@ -64,7 +70,6 @@ def get_random_color() -> str:
 class AttentionPattern:
     sourceLayer: int
     sourceToken: int
-    destLayer: int
     destToken: int
     weight: float
     head: int
@@ -83,6 +88,7 @@ class HeadGroup:
     heads: List[HeadPair]
     description: Optional[str] = None
     color: Optional[str] = None  # Add color field
+    group_type: str = "custom"
 
 def get_head_color(layer: int, head: int, head_groups: List[HeadGroup]) -> str:
     """Get the color for a head based on its group membership."""
@@ -94,6 +100,45 @@ def get_head_color(layer: int, head: int, head_groups: List[HeadGroup]) -> str:
     
     # Default blue for heads not in any group
     return '#3B82F6'
+
+def get_active_head_groups(all_groups: List[HeadGroup], active_group_ids: List[int]) -> List[HeadGroup]:
+    """Return only groups that are currently active in the graph."""
+    active_ids = set(active_group_ids)
+    return [group for group in all_groups if group.id in active_ids]
+
+
+def iter_attention_patterns(data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize backend and sample attention payloads into a flat edge list."""
+    if not data:
+        return []
+
+    if "attentionHeads" in data:
+        patterns: List[Dict[str, Any]] = []
+        for head_payload in data.get("attentionHeads", []):
+            layer = head_payload["layer"]
+            head = head_payload["head"]
+            for source_token, dest_token, weight in head_payload.get("edges", []):
+                patterns.append(
+                    {
+                        "sourceLayer": layer,
+                        "sourceToken": source_token,
+                        "destToken": dest_token,
+                        "weight": weight,
+                        "head": head,
+                    }
+                )
+        return patterns
+
+    return data.get("attentionPatterns", [])
+
+
+def get_attention_pattern_count(data: Optional[Dict[str, Any]]) -> int:
+    """Return the number of visible serialized edges in either payload format."""
+    if not data:
+        return 0
+    if "numEdges" in data:
+        return int(data["numEdges"])
+    return len(data.get("attentionPatterns", []))
 
 class APIService:
     def __init__(self, base_url: str = None):
@@ -142,10 +187,23 @@ class APIService:
             logger.error(f"Unexpected error checking backend health: {str(e)}")
             return False
 
-    def process_text(self, text: str, model: str) -> Dict:
+    def process_text(
+        self,
+        text: str,
+        model: str,
+        threshold: float,
+        top_k: int,
+        selected_heads: List[Dict[str, int]],
+    ) -> Dict:
         response = requests.post(
             f"{self.base_url}/process",
-            json={"text": text, "model_name": model},
+            json={
+                "text": text,
+                "model_name": model,
+                "threshold": threshold,
+                "top_k": top_k,
+                "selected_heads": selected_heads,
+            },
             timeout=30
         )
         if response.status_code != 200:
@@ -173,6 +231,76 @@ class APIService:
             raise Exception(f"API error: {response.text}")
         return response.json()
 
+    def list_datasets(self) -> List[Dict[str, Any]]:
+        response = requests.get(f"{self.base_url}/datasets", timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()["datasets"]
+
+    def get_dataset(self, dataset_name: str) -> Dict[str, Any]:
+        response = requests.get(f"{self.base_url}/datasets/{dataset_name}", timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()
+
+    def validate_dataset(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(f"{self.base_url}/datasets/validate", json={"payload": payload}, timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()
+
+    def save_dataset(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(f"{self.base_url}/datasets/save", json={"payload": payload}, timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()
+
+    def evaluate_dataset(
+        self,
+        dataset_name: str,
+        model: Optional[str],
+        ablated_heads: List[Dict[str, int]]
+    ) -> Dict:
+        response = requests.post(
+            f"{self.base_url}/evaluate-dataset",
+            json={
+                "dataset_name": dataset_name,
+                "model_name": model,
+                "ablated_heads": ablated_heads,
+            },
+            timeout=180
+        )
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()
+
+    def build_max_logit_diff_graph(
+        self,
+        text: str,
+        corrupted_text: str,
+        model: str,
+        target_token: Optional[str],
+        top_k: int,
+        top_heads_per_layer: int,
+        selected_heads: List[Dict[str, int]],
+    ) -> Dict:
+        response = requests.post(
+            f"{self.base_url}/max-logit-diff-graph",
+            json={
+                "text": text,
+                "corrupted_text": corrupted_text,
+                "model_name": model,
+                "target_token": target_token,
+                "top_k": top_k,
+                "top_heads_per_layer": top_heads_per_layer,
+                "selected_heads": selected_heads,
+            },
+            timeout=180,
+        )
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.text}")
+        return response.json()
+
 def get_default_text_for_model(model: str) -> str:
     """Get the default text for a given model from configuration."""
     return MODEL_DEFAULTS.get(model, {}).get("default_text", "")
@@ -181,6 +309,63 @@ def get_task_presets_for_model(model: str) -> List[Dict[str, str]]:
     """Return task presets for a model."""
     return MODEL_DEFAULTS.get(model, {}).get("task_presets", [])
 
+def get_model_dimensions(model: str, attention_data: Optional[Dict] = None) -> Tuple[int, int]:
+    """Return source-layer count and heads per layer for a model."""
+    if attention_data:
+        num_layers = max(int(attention_data.get("numLayers", 1)) - 1, 1)
+        num_heads = int(attention_data.get("numHeads", 0))
+        if num_heads > 0:
+            return num_layers, num_heads
+
+    model_info = MODEL_INFO.get(model)
+    if model_info:
+        return model_info["layers"], model_info["heads"]
+    return 0, 0
+
+def parse_uploaded_dataset(uploaded_file) -> Dict[str, Any]:
+    """Parse uploaded JSON or CSV dataset into the canonical payload."""
+    file_name = uploaded_file.name.lower()
+    raw_bytes = uploaded_file.getvalue()
+
+    if file_name.endswith(".json"):
+        payload = json.loads(raw_bytes.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON dataset must be an object.")
+        return payload
+
+    if file_name.endswith(".csv"):
+        frame = pd.read_csv(io.BytesIO(raw_bytes))
+        required_columns = {"id", "text", "target_token"}
+        missing_columns = required_columns - set(frame.columns)
+        if missing_columns:
+            raise ValueError(f"CSV dataset is missing required columns: {', '.join(sorted(missing_columns))}")
+
+        examples = []
+        for row in frame.fillna("").to_dict(orient="records"):
+            example = {
+                "id": str(row["id"]),
+                "text": str(row["text"]),
+                "target_token": str(row["target_token"]),
+            }
+            if str(row.get("corrupted_text", "")).strip():
+                example["corrupted_text"] = str(row["corrupted_text"])
+            metadata = {
+                key: value for key, value in row.items()
+                if key not in {"id", "text", "target_token", "corrupted_text"} and str(value).strip()
+            }
+            if metadata:
+                example["metadata"] = metadata
+            examples.append(example)
+
+        return {
+            "name": Path(uploaded_file.name).stem,
+            "description": "Uploaded from CSV",
+            "metric": "target_probability",
+            "examples": examples,
+        }
+
+    raise ValueError("Unsupported file type. Please upload a JSON or CSV dataset.")
+
 def create_attention_graph(
     data: Dict,
     threshold: float,
@@ -188,19 +373,17 @@ def create_attention_graph(
     head_groups: List[HeadGroup]
 ) -> None:
     """Create graph visualization using D3.js."""
-    logger.info(f"Creating graph with data: numLayers={data['numLayers']}, numTokens={data['numTokens']}, numPatterns={len(data['attentionPatterns'])}")
+    logger.info(
+        "Creating graph with data: numLayers=%s, numTokens=%s, numPatterns=%s",
+        data["numLayers"],
+        data["numTokens"],
+        get_attention_pattern_count(data),
+    )
     logger.info(f"Selected heads: {[(h.layer, h.head) for h in selected_heads]}")
     logger.info(f"Head groups: {[(g.name, len(g.heads)) for g in head_groups]}")
     
     # Filter attention patterns based on threshold and selected heads
-    visible_heads = selected_heads + [head for group in head_groups for head in group.heads]
-    filtered_patterns = [
-        pattern for pattern in data['attentionPatterns']
-        if pattern['weight'] >= threshold and any(
-            h.layer == pattern['sourceLayer'] and h.head == pattern['head'] 
-            for h in visible_heads
-        )
-    ]
+    filtered_patterns = get_filtered_attention_patterns(data, threshold, selected_heads, head_groups)
 
     # Prepare data for D3 visualization
     viz_data = {
@@ -367,7 +550,7 @@ def create_attention_graph(
                 }})
                 .map(edge => ({{
                     source: `${{edge.sourceLayer}}-${{edge.sourceToken}}`,
-                    target: `${{edge.destLayer}}-${{edge.destToken}}`,
+                    target: `${{edge.sourceLayer + 1}}-${{edge.destToken}}`,
                     weight: edge.weight,
                     head: edge.head,
                     groupId: getHeadGroup(edge.sourceLayer, edge.head) ?? -1
@@ -618,6 +801,223 @@ def create_attention_graph(
     # Display the visualization
     st.components.v1.html(html, height=800)
 
+def create_max_logit_diff_graph(data: Dict) -> None:
+    """Create a graph for the best clean-corrupted logit-diff head in each layer at the final position."""
+    html = f"""
+    <div id="max-logit-diff-container" style="width: 100%; height: 800px;"></div>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        .causal-line {{
+            fill: none;
+            stroke-linecap: round;
+            cursor: pointer;
+        }}
+        .causal-node {{
+            cursor: pointer;
+        }}
+        #causal-graph-tooltip {{
+            display: none;
+            position: absolute;
+            background: rgba(255, 255, 255, 0.98);
+            padding: 8px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 1000;
+            box-shadow: 0 10px 25px rgba(15, 23, 42, 0.12);
+        }}
+    </style>
+    <script>
+        const data = {json.dumps(data)};
+        const dims = {{
+            width: 1000,
+            height: 700,
+            padding: {{ top: 40, right: 40, bottom: 60, left: 60 }}
+        }};
+
+        const svg = d3.select("#max-logit-diff-container")
+            .append("svg")
+            .attr("width", dims.width)
+            .attr("height", dims.height);
+
+        const width = dims.width;
+        const height = dims.height;
+        const padding = dims.padding;
+        const graphWidth = width - padding.left - padding.right;
+        const graphHeight = height - padding.top - padding.bottom;
+        const tokenWidth = graphWidth / data.numTokens;
+        const layerHeight = graphHeight / (data.numLayers - 1);
+        const selectedNodes = data.importantNodes || [];
+        const selectedNodeLookup = new Map();
+        selectedNodes.forEach(node => {{
+            const key = `${{node.layer}}-${{node.token}}`;
+            if (!selectedNodeLookup.has(key)) {{
+                selectedNodeLookup.set(key, []);
+            }}
+            selectedNodeLookup.get(key).push(node);
+        }});
+        const edgeScores = data.attentionPatterns.map(edge => Math.abs(edge.combined_score));
+        const maxEdgeScore = d3.max(edgeScores) || 1;
+        const colorScale = d3.scaleLinear()
+            .domain([-1, 0, 1])
+            .range(["#b91c1c", "#a8a29e", "#166534"]);
+
+        const nodes = [];
+        for (let layer = 0; layer < data.numLayers; layer++) {{
+            for (let token = 0; token < data.numTokens; token++) {{
+                nodes.push({{
+                    id: `${{layer}}-${{token}}`,
+                    layer,
+                    token,
+                    x: padding.left + token * tokenWidth + tokenWidth / 2,
+                    y: height - (padding.bottom + layer * layerHeight)
+                }});
+            }}
+        }}
+
+        const g = svg.append("g");
+        const tooltip = document.createElement("div");
+        tooltip.id = "causal-graph-tooltip";
+        document.body.appendChild(tooltip);
+
+        for (let layer = 0; layer < data.numLayers; layer++) {{
+            g.append("text")
+                .attr("x", padding.left / 2 + 25)
+                .attr("y", height - (padding.bottom + layer * layerHeight))
+                .attr("text-anchor", "middle")
+                .attr("dominant-baseline", "middle")
+                .text(layer.toString());
+        }}
+
+        for (let token = 0; token < data.numTokens; token++) {{
+            g.append("text")
+                .attr("x", padding.left + token * tokenWidth + tokenWidth / 2)
+                .attr("y", height - padding.bottom / 2)
+                .attr("text-anchor", "middle")
+                .attr("dominant-baseline", "middle")
+                .text(data.tokens?.[token] || `T${{token}}`);
+        }}
+
+        g.selectAll("circle")
+            .data(nodes)
+            .enter()
+            .append("circle")
+            .attr("class", "causal-node")
+            .attr("cx", d => d.x)
+            .attr("cy", d => d.y)
+            .attr("r", d => selectedNodeLookup.has(`${{d.layer}}-${{d.token}}`) ? 9 : 5)
+            .attr("fill", d => {{
+                const nodeList = selectedNodeLookup.get(`${{d.layer}}-${{d.token}}`);
+                const topNode = nodeList?.[0];
+                return topNode
+                    ? colorScale(Math.max(-1, Math.min(1, topNode.logit_diff_delta / (Math.abs(topNode.logit_diff_delta) || 1))))
+                    : "#d6d3d1";
+            }})
+            .attr("stroke", d => selectedNodeLookup.has(`${{d.layer}}-${{d.token}}`) ? "#1f2937" : "none")
+            .attr("stroke-width", d => selectedNodeLookup.has(`${{d.layer}}-${{d.token}}`) ? 1.5 : 0)
+            .on("mouseover", function(event, d) {{
+                const tooltipDiv = d3.select("#causal-graph-tooltip");
+                const nodeList = selectedNodeLookup.get(`${{d.layer}}-${{d.token}}`);
+                if (nodeList?.length) {{
+                    const headLines = nodeList.map(node =>
+                        `L${{node.sourceLayer}}H${{node.head}} (#${{(node.rankInLayer || 0) + 1}}): ${{node.logit_diff_delta.toFixed(4)}}`
+                    ).join("<br>");
+                    tooltipDiv.style("display", "block")
+                        .html(
+                            `Layer ${{d.layer}}, Token ${{d.token}}<br>` +
+                            `Important heads:<br>${{headLines}}`
+                        )
+                        .style("left", (event.pageX + 12) + "px")
+                        .style("top", (event.pageY - 12) + "px");
+                }} else {{
+                    tooltipDiv.style("display", "block")
+                        .html(`Layer ${{d.layer}}, Token ${{d.token}}`)
+                        .style("left", (event.pageX + 12) + "px")
+                        .style("top", (event.pageY - 12) + "px");
+                }}
+            }})
+            .on("mouseout", function() {{
+                d3.select("#causal-graph-tooltip").style("display", "none");
+            }});
+
+        g.selectAll("path")
+            .data(data.attentionPatterns)
+            .enter()
+            .append("path")
+            .attr("class", "causal-line")
+            .attr("d", edge => {{
+                const source = nodes.find(node => node.id === `${{edge.sourceLayer}}-${{edge.sourceToken}}`);
+                const target = nodes.find(node => node.id === `${{edge.sourceLayer + 1}}-${{edge.destToken}}`);
+                const dx = target.x - source.x;
+                const controlPoint1x = source.x + dx * 0.5;
+                const controlPoint1y = source.y;
+                const controlPoint2x = target.x - dx * 0.5;
+                const controlPoint2y = target.y;
+                return `M ${{source.x}} ${{source.y}} C ${{controlPoint1x}} ${{controlPoint1y}}, ${{controlPoint2x}} ${{controlPoint2y}}, ${{target.x}} ${{target.y}}`;
+            }})
+            .attr("stroke", edge => colorScale(Math.max(-1, Math.min(1, edge.logit_diff_delta / (Math.abs(edge.logit_diff_delta) || 1)))))
+            .attr("stroke-width", edge => 2 + 8 * (Math.abs(edge.combined_score) / maxEdgeScore))
+            .attr("stroke-opacity", edge => 0.28 + 0.72 * (Math.abs(edge.combined_score) / maxEdgeScore))
+            .on("mouseover", function(event, edge) {{
+                d3.select(this).attr("stroke-opacity", 1);
+                d3.select("#causal-graph-tooltip")
+                    .style("display", "block")
+                    .html(
+                        `L${{edge.sourceLayer}}H${{edge.head}}<br>` +
+                        `source: ${{data.tokens?.[edge.sourceToken] || edge.sourceToken}} -> target: ${{data.tokens?.[edge.destToken] || edge.destToken}}<br>` +
+                        `attention: ${{edge.weight.toFixed(4)}}<br>` +
+                        `clean - corrupted: ${{edge.logit_diff_delta.toFixed(4)}}`
+                    )
+                    .style("left", (event.pageX + 12) + "px")
+                    .style("top", (event.pageY - 12) + "px");
+            }})
+            .on("mouseout", function(event, edge) {{
+                d3.select(this)
+                    .attr("stroke-opacity", 0.28 + 0.72 * (Math.abs(edge.combined_score) / maxEdgeScore));
+                d3.select("#causal-graph-tooltip").style("display", "none");
+            }});
+
+        const labelGroup = g.append("g");
+        const highlightedNodes = selectedNodes.map(node => {{
+            const graphNode = nodes.find(candidate => candidate.id === `${{node.layer}}-${{node.token}}`);
+            return {{
+                ...node,
+                x: graphNode?.x ?? 0,
+                y: graphNode?.y ?? 0
+            }};
+        }});
+
+        const labelSelection = labelGroup.selectAll("g")
+            .data(highlightedNodes)
+            .enter()
+            .append("g")
+            .attr("transform", node => `translate(${{node.x + 12 + (node.rankInLayer || 0) * 52}}, ${{node.y - 10}})`);
+
+        labelSelection.append("rect")
+            .attr("class", "causal-head-halo")
+            .attr("rx", 6)
+            .attr("ry", 6)
+            .attr("width", 66)
+            .attr("height", 18);
+
+        labelSelection.append("text")
+            .attr("class", "causal-head-label")
+            .attr("x", 6)
+            .attr("y", 12)
+            .text(node => `H${{node.head}}`);
+
+        g.append("text")
+            .attr("x", padding.left)
+            .attr("y", padding.top - 12)
+            .attr("font-size", "13px")
+            .attr("font-weight", "600")
+            .text(`Important heads for all layers at final token position ${{data.selectedPosition}}`);
+    </script>
+    """
+
+    st.components.v1.html(html, height=800)
+
 def convert_predefined_groups_to_head_groups(model: str) -> List[HeadGroup]:
     """Convert predefined groups from MODEL_SPECIFIC_GROUPS to HeadGroup objects."""
     groups = MODEL_SPECIFIC_GROUPS.get(model, [])
@@ -627,7 +1027,8 @@ def convert_predefined_groups_to_head_groups(model: str) -> List[HeadGroup]:
             name=group["name"],
             description=group.get("description"),
             heads=[HeadPair(layer=layer, head=head) for layer, head in group["vertices"]],
-            color=None  # Initialize with no custom color
+            color=None,
+            group_type="predefined",
         )
         for idx, group in enumerate(groups)
     ]
@@ -676,7 +1077,7 @@ def get_filtered_attention_patterns(
         return []
 
     return [
-        pattern for pattern in data["attentionPatterns"]
+        pattern for pattern in iter_attention_patterns(data)
         if pattern["weight"] >= threshold and (pattern["sourceLayer"], pattern["head"]) in visible_heads
     ]
 
@@ -860,6 +1261,186 @@ def format_metric_value(value: Optional[float], precision: int = 4) -> str:
         return "n/a"
     return f"{value:.{precision}f}"
 
+def format_int_metric(value: Optional[int]) -> str:
+    """Format integer metrics for display."""
+    if value is None:
+        return "n/a"
+    return str(value)
+
+def append_unique_heads(existing_heads: List[HeadPair], new_heads: List[HeadPair]) -> List[HeadPair]:
+    """Append heads without duplicating layer/head pairs."""
+    seen = {(head.layer, head.head) for head in existing_heads}
+    merged_heads = list(existing_heads)
+    for head in new_heads:
+        key = (head.layer, head.head)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged_heads.append(HeadPair(layer=head.layer, head=head.head, color=head.color))
+    return merged_heads
+
+def next_group_id(all_groups: List[HeadGroup]) -> int:
+    """Return the next available group id."""
+    return max((group.id for group in all_groups), default=-1) + 1
+
+def refresh_dataset_catalog() -> None:
+    """Refresh dataset catalog from backend and keep selection stable."""
+    if not st.session_state.backend_available:
+        st.session_state.dataset_catalog = []
+        st.session_state.selected_dataset_detail = None
+        return
+
+    try:
+        catalog = st.session_state.api_service.list_datasets()
+        st.session_state.dataset_catalog = catalog
+        dataset_names = [dataset["dataset_name"] for dataset in catalog]
+        if dataset_names:
+            if st.session_state.selected_dataset_name not in dataset_names:
+                st.session_state.selected_dataset_name = dataset_names[0]
+            st.session_state.selected_dataset_detail = st.session_state.api_service.get_dataset(
+                st.session_state.selected_dataset_name
+            )
+        else:
+            st.session_state.selected_dataset_name = None
+            st.session_state.selected_dataset_detail = None
+    except Exception as e:
+        st.error(f"Error loading datasets: {str(e)}")
+
+
+def build_selected_head_payload(selected_heads: List[HeadPair], head_groups: List[HeadGroup]) -> List[Dict[str, int]]:
+    """Serialize visible heads for backend filtering."""
+    return [
+        {"layer": head.layer, "head": head.head}
+        for head in get_visible_head_pairs(selected_heads, head_groups)
+    ]
+
+
+def fetch_attention_data(force: bool = False) -> None:
+    """Fetch sparse attention data from the backend for the current prompt."""
+    if not st.session_state.backend_available or st.session_state.analysis_source != "Single prompt":
+        return
+
+    input_text = st.session_state.input_text.strip()
+    if not input_text:
+        return
+
+    active_groups = get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids)
+    selected_head_payload = build_selected_head_payload(st.session_state.selected_heads, active_groups)
+    request_signature = {
+        "text": input_text,
+        "model": st.session_state.current_model,
+        "threshold": round(float(st.session_state.threshold), 4),
+        "top_k": int(st.session_state.attention_top_k),
+        "selected_heads": [(item["layer"], item["head"]) for item in selected_head_payload],
+    }
+
+    if not force:
+        previous_signature = st.session_state.get("attention_request_signature")
+        previous_text = st.session_state.get("last_processed_input_text")
+        previous_model = st.session_state.get("last_processed_model")
+        if (
+            previous_signature == request_signature
+            or previous_text != input_text
+            or previous_model != st.session_state.current_model
+        ):
+            return
+
+    st.session_state.loading = True
+    try:
+        st.session_state.attention_data = st.session_state.api_service.process_text(
+            input_text,
+            st.session_state.current_model,
+            threshold=float(st.session_state.threshold),
+            top_k=int(st.session_state.attention_top_k),
+            selected_heads=selected_head_payload,
+        )
+        st.session_state.attention_request_signature = request_signature
+        st.session_state.last_processed_input_text = input_text
+        st.session_state.last_processed_model = st.session_state.current_model
+    finally:
+        st.session_state.loading = False
+
+def fetch_max_logit_diff_graph(force: bool = False) -> None:
+    """Fetch the causal graph payload for the current clean/corrupted prompt pair."""
+    if not st.session_state.backend_available:
+        return
+
+    clean_text = st.session_state.input_text.strip()
+    corrupted_text = st.session_state.corrupted_input_text.strip()
+    if not clean_text or not corrupted_text:
+        return
+
+    active_groups = get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids)
+    selected_head_payload = build_selected_head_payload(st.session_state.selected_heads, active_groups)
+    request_signature = {
+        "text": clean_text,
+        "corrupted_text": corrupted_text,
+        "model": st.session_state.current_model,
+        "target_token": st.session_state.target_token,
+        "top_k": int(st.session_state.attention_top_k),
+        "top_heads_per_layer": int(st.session_state.causal_top_heads_per_layer),
+        "selected_heads": [(item["layer"], item["head"]) for item in selected_head_payload],
+    }
+
+    if not force and st.session_state.get("causal_graph_signature") == request_signature:
+        return
+
+    st.session_state.loading = True
+    try:
+        st.session_state.causal_graph_data = st.session_state.api_service.build_max_logit_diff_graph(
+            text=clean_text,
+            corrupted_text=corrupted_text,
+            model=st.session_state.current_model,
+            target_token=st.session_state.target_token,
+            top_k=int(st.session_state.attention_top_k),
+            top_heads_per_layer=int(st.session_state.causal_top_heads_per_layer),
+            selected_heads=selected_head_payload,
+        )
+        st.session_state.causal_graph_signature = request_signature
+    finally:
+        st.session_state.loading = False
+
+def causal_graph_matches_current_state() -> bool:
+    """Check whether the cached causal graph matches the current controls."""
+    signature = st.session_state.get("causal_graph_signature")
+    if not signature:
+        return False
+
+    active_groups = get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids)
+    selected_head_payload = build_selected_head_payload(st.session_state.selected_heads, active_groups)
+    current_signature = {
+        "text": st.session_state.input_text.strip(),
+        "corrupted_text": st.session_state.corrupted_input_text.strip(),
+        "model": st.session_state.current_model,
+        "target_token": st.session_state.target_token,
+        "top_k": int(st.session_state.attention_top_k),
+        "top_heads_per_layer": int(st.session_state.causal_top_heads_per_layer),
+        "selected_heads": [(item["layer"], item["head"]) for item in selected_head_payload],
+    }
+    return signature == current_signature
+
+def build_important_heads_frame(causal_graph_data: Optional[Dict[str, Any]]) -> pd.DataFrame:
+    """Build a compact table of important heads across layers."""
+    if not causal_graph_data:
+        return pd.DataFrame()
+
+    rows = [
+        {
+            "Layer": node["sourceLayer"],
+            "Head": f"H{node['head']}",
+            "Rank in layer": node.get("rankInLayer", 0) + 1,
+            "Clean - corrupted": node["logit_diff_delta"],
+            "Clean contribution": node["clean_logit_diff"],
+            "Corrupted contribution": node["corrupted_logit_diff"],
+        }
+        for node in causal_graph_data.get("importantNodes", [])
+    ]
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(["Layer", "Rank in layer"]).reset_index(drop=True)
+
 def main():
     st.set_page_config(layout="wide", page_title="Information Flow Visualization")
 
@@ -872,14 +1453,26 @@ def main():
         st.session_state.current_model = "gpt2-small"
     if 'threshold' not in st.session_state:
         st.session_state.threshold = 0.4
+    if 'attention_top_k' not in st.session_state:
+        st.session_state.attention_top_k = 12
+    if 'causal_top_heads_per_layer' not in st.session_state:
+        st.session_state.causal_top_heads_per_layer = 3
     if 'selected_heads' not in st.session_state:
         st.session_state.selected_heads = []
     if 'head_groups' not in st.session_state:
         st.session_state.head_groups = convert_predefined_groups_to_head_groups(st.session_state.current_model)
+    if 'active_group_ids' not in st.session_state:
+        st.session_state.active_group_ids = []
     if 'input_text' not in st.session_state:
         st.session_state.input_text = get_default_text_for_model(st.session_state.current_model)
     if 'attention_data' not in st.session_state:
         st.session_state.attention_data = None
+    if 'attention_request_signature' not in st.session_state:
+        st.session_state.attention_request_signature = None
+    if 'last_processed_input_text' not in st.session_state:
+        st.session_state.last_processed_input_text = ""
+    if 'last_processed_model' not in st.session_state:
+        st.session_state.last_processed_model = st.session_state.current_model
     if 'loading' not in st.session_state:
         st.session_state.loading = False
     if 'color_change_group' not in st.session_state:
@@ -896,12 +1489,34 @@ def main():
         st.session_state.selected_task_preset = "Custom"
     if 'evaluation_result' not in st.session_state:
         st.session_state.evaluation_result = None
+    if 'dataset_evaluation_result' not in st.session_state:
+        st.session_state.dataset_evaluation_result = None
     if 'ablation_mode' not in st.session_state:
         st.session_state.ablation_mode = "Selected heads"
     if 'selected_group_for_ablation' not in st.session_state:
         st.session_state.selected_group_for_ablation = None
     if 'selected_layer_for_ablation' not in st.session_state:
         st.session_state.selected_layer_for_ablation = 0
+    if 'new_candidate_group_name' not in st.session_state:
+        st.session_state.new_candidate_group_name = ""
+    if 'analysis_source' not in st.session_state:
+        st.session_state.analysis_source = "Single prompt"
+    if 'dataset_catalog' not in st.session_state:
+        st.session_state.dataset_catalog = []
+    if 'selected_dataset_name' not in st.session_state:
+        st.session_state.selected_dataset_name = None
+    if 'selected_dataset_detail' not in st.session_state:
+        st.session_state.selected_dataset_detail = None
+    if 'dataset_validation_result' not in st.session_state:
+        st.session_state.dataset_validation_result = None
+    if 'corrupted_input_text' not in st.session_state:
+        st.session_state.corrupted_input_text = ""
+    if 'graph_view_mode' not in st.session_state:
+        st.session_state.graph_view_mode = "Attention weights"
+    if 'causal_graph_data' not in st.session_state:
+        st.session_state.causal_graph_data = None
+    if 'causal_graph_signature' not in st.session_state:
+        st.session_state.causal_graph_signature = None
 
     # Custom CSS
     st.markdown("""
@@ -1168,7 +1783,6 @@ def main():
             <div class="hero-band">
                 <div class="hero-kicker">Circuit Workbench</div>
                 <div class="hero-title">Trace hypotheses, inspect head groups, and prepare causal experiments.</div>
-                <div class="hero-copy">The graph remains the main workspace, while the surrounding panels surface the visible signal budget and the next interventions a mechanistic interpretability researcher would want to run.</div>
             </div>
         """,
         unsafe_allow_html=True
@@ -1187,9 +1801,14 @@ def main():
         if selected_model != st.session_state.current_model:
             st.session_state.current_model = selected_model
             st.session_state.head_groups = convert_predefined_groups_to_head_groups(selected_model)
+            st.session_state.active_group_ids = []
             st.session_state.input_text = get_default_text_for_model(selected_model)
+            st.session_state.corrupted_input_text = ""
             st.session_state.attention_data = None
             st.session_state.evaluation_result = None
+            st.session_state.dataset_evaluation_result = None
+            st.session_state.causal_graph_data = None
+            st.session_state.causal_graph_signature = None
             st.session_state.selected_task_preset = "Custom"
             presets = get_task_presets_for_model(selected_model)
             st.session_state.target_token = presets[0]["target_token"] if presets else ""
@@ -1204,6 +1823,9 @@ def main():
                 st.error("Failed to load sample data. Please try again later.")
                 return
 
+    if st.session_state.backend_available and not st.session_state.dataset_catalog:
+        refresh_dataset_catalog()
+
     preset_definitions = get_task_presets_for_model(st.session_state.current_model)
     preset_names = ["Custom"] + [preset["name"] for preset in preset_definitions]
     if st.session_state.selected_task_preset not in preset_names:
@@ -1215,35 +1837,108 @@ def main():
     with task_col:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.markdown('<div class="panel-title">Task Context</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="panel-copy">Start from a benchmark-style prompt, then define the target token whose probability should rise or fall when you ablate candidate heads.</div>',
-            unsafe_allow_html=True
+        st.session_state.analysis_source = st.radio(
+            "Analysis Source",
+            ["Single prompt", "Dataset"],
+            index=["Single prompt", "Dataset"].index(st.session_state.analysis_source),
+            horizontal=True,
         )
-        selected_preset = st.selectbox(
-            "Task Preset",
-            options=preset_names,
-            index=preset_names.index(st.session_state.selected_task_preset)
-        )
-        if selected_preset != st.session_state.selected_task_preset:
-            st.session_state.selected_task_preset = selected_preset
-            st.session_state.evaluation_result = None
-            if selected_preset != "Custom":
-                preset = next(preset for preset in preset_definitions if preset["name"] == selected_preset)
-                st.session_state.input_text = preset["text"]
-                st.session_state.target_token = preset.get("target_token", "")
-
-        if st.session_state.selected_task_preset != "Custom":
-            active_preset = next(
-                preset for preset in preset_definitions
-                if preset["name"] == st.session_state.selected_task_preset
+        if st.session_state.analysis_source == "Single prompt":
+            st.markdown(
+                '<div class="panel-copy">Start from a benchmark-style prompt, then define the target token whose probability should rise or fall when you ablate candidate heads.</div>',
+                unsafe_allow_html=True
             )
-            st.caption(active_preset.get("description", ""))
+            selected_preset = st.selectbox(
+                "Task Preset",
+                options=preset_names,
+                index=preset_names.index(st.session_state.selected_task_preset)
+            )
+            if selected_preset != st.session_state.selected_task_preset:
+                st.session_state.selected_task_preset = selected_preset
+                st.session_state.evaluation_result = None
+                if selected_preset != "Custom":
+                    preset = next(preset for preset in preset_definitions if preset["name"] == selected_preset)
+                    st.session_state.input_text = preset["text"]
+                    st.session_state.target_token = preset.get("target_token", "")
 
-        st.session_state.target_token = st.text_input(
-            "Target Token",
-            value=st.session_state.target_token,
-            placeholder="e.g. Mary, Paris, gate"
-        )
+            if st.session_state.selected_task_preset != "Custom":
+                active_preset = next(
+                    preset for preset in preset_definitions
+                    if preset["name"] == st.session_state.selected_task_preset
+                )
+                st.caption(active_preset.get("description", ""))
+
+            st.session_state.target_token = st.text_input(
+                "Target Token",
+                value=st.session_state.target_token,
+                placeholder="e.g. Mary, Paris, gate"
+            )
+            st.session_state.corrupted_input_text = st.text_area(
+                "Corrupted Prompt (for clean-corrupted graph variant)",
+                value=st.session_state.corrupted_input_text,
+                height=120,
+                placeholder="Optional, but required for the max clean-corrupted logit diff graph."
+            )
+        else:
+            st.markdown(
+                '<div class="panel-copy">Select a reusable benchmark set or upload a custom dataset for aggregate metrics and batch causal interventions.</div>',
+                unsafe_allow_html=True
+            )
+            if st.session_state.backend_available:
+                refresh_col1, refresh_col2 = st.columns([3, 1])
+                with refresh_col1:
+                    dataset_options = [
+                        f"{dataset['name']} ({dataset['storage']})"
+                        for dataset in st.session_state.dataset_catalog
+                        if dataset.get("model") in (None, st.session_state.current_model)
+                    ]
+                    filtered_datasets = [
+                        dataset for dataset in st.session_state.dataset_catalog
+                        if dataset.get("model") in (None, st.session_state.current_model)
+                    ]
+                    if filtered_datasets:
+                        selected_option = st.selectbox(
+                            "Dataset",
+                            options=dataset_options,
+                            index=next(
+                                (
+                                    idx for idx, dataset in enumerate(filtered_datasets)
+                                    if dataset["dataset_name"] == st.session_state.selected_dataset_name
+                                ),
+                                0,
+                            ),
+                        )
+                        selected_dataset = filtered_datasets[dataset_options.index(selected_option)]
+                        if selected_dataset["dataset_name"] != st.session_state.selected_dataset_name:
+                            st.session_state.selected_dataset_name = selected_dataset["dataset_name"]
+                            st.session_state.selected_dataset_detail = st.session_state.api_service.get_dataset(
+                                st.session_state.selected_dataset_name
+                            )
+                            st.session_state.dataset_evaluation_result = None
+                    else:
+                        st.info("No datasets available for the current model yet.")
+                with refresh_col2:
+                    if st.button("Refresh", key="refresh_datasets"):
+                        refresh_dataset_catalog()
+
+                dataset_detail = st.session_state.selected_dataset_detail
+                if dataset_detail:
+                    st.caption(dataset_detail.get("description", ""))
+                    st.caption(
+                        f"{len(dataset_detail.get('examples', []))} examples • "
+                        f"metric: {dataset_detail.get('metric', 'target_probability')} • "
+                        f"causal: {'yes' if all(example.get('corrupted_text') for example in dataset_detail.get('examples', [])) else 'no'}"
+                    )
+                    preview_frame = pd.DataFrame(dataset_detail.get("examples", [])[:5])
+                    if not preview_frame.empty:
+                        st.dataframe(preview_frame, use_container_width=True, hide_index=True)
+                    if st.button("Load first example into prompt workspace", key="load_dataset_example"):
+                        first_example = dataset_detail["examples"][0]
+                        st.session_state.input_text = first_example["text"]
+                        st.session_state.target_token = first_example.get("target_token", "")
+                        st.session_state.corrupted_input_text = first_example.get("corrupted_text", "")
+            else:
+                st.info("Dataset mode requires a live backend.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with compare_col:
@@ -1269,7 +1964,7 @@ def main():
         st.session_state.attention_data,
         st.session_state.threshold,
         st.session_state.selected_heads,
-        st.session_state.head_groups
+        get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids)
     )
     evaluation_result = st.session_state.evaluation_result
     baseline_metrics = evaluation_result.get("baseline") if evaluation_result else None
@@ -1310,6 +2005,63 @@ def main():
         unsafe_allow_html=True
     )
 
+    if st.session_state.analysis_source == "Dataset":
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Upload Custom Dataset</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Upload a JSON or CSV dataset, validate the schema, preview the examples, and save it into the local dataset catalog for repeated experiments.</div>',
+            unsafe_allow_html=True
+        )
+        uploaded_dataset = st.file_uploader(
+            "Dataset file",
+            type=["json", "csv"],
+            accept_multiple_files=False,
+            key="dataset_uploader",
+        )
+        upload_col1, upload_col2 = st.columns([1, 1])
+        if uploaded_dataset is not None:
+            if upload_col1.button("Validate Dataset", key="validate_dataset_button"):
+                try:
+                    payload = parse_uploaded_dataset(uploaded_dataset)
+                    st.session_state.dataset_validation_result = {
+                        "payload": payload,
+                        "result": st.session_state.api_service.validate_dataset(payload)
+                        if st.session_state.backend_available else None,
+                    }
+                except Exception as e:
+                    st.error(f"Error validating dataset: {str(e)}")
+
+            validation_bundle = st.session_state.dataset_validation_result
+            if validation_bundle and validation_bundle.get("payload"):
+                payload = validation_bundle["payload"]
+                validation = validation_bundle.get("result")
+                if validation:
+                    if validation["valid"]:
+                        st.success(
+                            f"Valid dataset: {validation['valid_examples']}/{validation['num_examples']} examples ready."
+                        )
+                    else:
+                        st.error("Dataset validation failed.")
+                    for error in validation.get("errors", []):
+                        st.caption(f"Error: {error}")
+                    for warning in validation.get("warnings", []):
+                        st.caption(f"Warning: {warning}")
+
+                preview_frame = pd.DataFrame(payload.get("examples", [])[:5])
+                if not preview_frame.empty:
+                    st.dataframe(preview_frame, use_container_width=True, hide_index=True)
+
+                if upload_col2.button("Save Dataset", key="save_dataset_button", disabled=not validation or not validation["valid"]):
+                    try:
+                        save_result = st.session_state.api_service.save_dataset(payload)
+                        st.success(f"Saved dataset '{save_result['dataset_name']}'")
+                        refresh_dataset_catalog()
+                        st.session_state.selected_dataset_name = save_result["dataset_name"]
+                        st.session_state.selected_dataset_detail = save_result["dataset"]
+                    except Exception as e:
+                        st.error(f"Error saving dataset: {str(e)}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
     # Controls section
     with st.expander("Controls", expanded=True):
         st.markdown('<div class="controls-container">', unsafe_allow_html=True)
@@ -1317,49 +2069,104 @@ def main():
         
         with col1:
             st.subheader("Head Groups")
-            
-            # New group creation
-            new_group = st.text_input("New group name", placeholder="Create a new group to organize attention heads")
-            if st.button("Create", type="primary"):
-                if new_group:
-                    new_group_obj = HeadGroup(
-                        id=len(st.session_state.head_groups),
-                        name=new_group,
-                        heads=[],
-                        color=get_random_color()
-                    )
-                    st.session_state.head_groups.append(new_group_obj)
-                else:
-                    st.error("Group name cannot be empty")
+            st.caption("Use the circuit library as hypotheses, and save promising current selections as candidate groups.")
 
-            # Display existing groups with color pickers
-            for group in st.session_state.head_groups:
-                # Create a container for the group
+            predefined_groups = [group for group in st.session_state.head_groups if group.group_type == "predefined"]
+            custom_groups = [group for group in st.session_state.head_groups if group.group_type == "custom"]
+
+            st.markdown("**Circuit Library**")
+            for group in predefined_groups:
+                is_active = group.id in st.session_state.active_group_ids
                 group_container = st.container()
                 with group_container:
-                    # Create a single row with two columns
-                    group_col1, group_col2 = st.columns([6, 1])
-                    
-                    # Left column with group content
+                    group_col1, group_col2, group_col3, group_col4 = st.columns([4.7, 1.2, 1.2, 0.8])
                     with group_col1:
                         st.markdown(f"""
                             <div class="group-container">
                                 <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                                    <div style="font-weight: 500;">{group.name}</div>
+                                    <div style="font-weight: 600;">{group.name}</div>
                                 </div>
                                 <div class="group-description">{group.description or ''}</div>
                                 <div style="display: flex; flex-wrap: wrap; gap: 4px;">
-                                    {''.join([f'<span class="head-button" style="background-color: {group.color or (":,: in group.heads" and get_random_color() or COLOR_PALETTE[group.id % len(COLOR_PALETTE)])}">{head.layer},{head.head}</span>' for head in group.heads])}
+                                    {''.join([f'<span class="head-button" style="background-color: {group.color or COLOR_PALETTE[group.id % len(COLOR_PALETTE)]}">{head.layer},{head.head}</span>' for head in group.heads])}
                                 </div>
                             </div>
                         """, unsafe_allow_html=True)
-                    
-                    # Right column with color picker and remove buttons
                     with group_col2:
+                        button_label = "Hide" if is_active else "Show"
+                        if st.button(button_label, key=f"toggle_group_{group.id}", type="primary" if not is_active else "secondary"):
+                            if is_active:
+                                st.session_state.active_group_ids = [active_id for active_id in st.session_state.active_group_ids if active_id != group.id]
+                            else:
+                                st.session_state.active_group_ids = st.session_state.active_group_ids + [group.id]
+                    with group_col3:
+                        if st.button("Use heads", key=f"use_group_heads_{group.id}"):
+                            st.session_state.selected_heads = append_unique_heads(st.session_state.selected_heads, group.heads)
+                    with group_col4:
                         if st.button("🎨", key=f"color_{group.id}", help="Change group color"):
                             group.color = get_random_color()
-                        if st.button("×", key=f"remove_group_{group.id}", help="Remove group"):
-                            st.session_state.head_groups = [g for g in st.session_state.head_groups if g.id != group.id]
+
+            st.markdown("**Candidate Groups**")
+            st.session_state.new_candidate_group_name = st.text_input(
+                "Save current selection as group",
+                value=st.session_state.new_candidate_group_name,
+                placeholder="e.g. IOI candidate circuit"
+            )
+            create_candidate_disabled = len(st.session_state.selected_heads) == 0
+            if st.button("Save Selection", type="primary", disabled=create_candidate_disabled):
+                if st.session_state.new_candidate_group_name.strip():
+                    new_group_obj = HeadGroup(
+                        id=next_group_id(st.session_state.head_groups),
+                        name=st.session_state.new_candidate_group_name.strip(),
+                        heads=get_unique_head_pairs(st.session_state.selected_heads),
+                        color=get_random_color(),
+                        description="Saved from current selected heads.",
+                        group_type="custom",
+                    )
+                    st.session_state.head_groups.append(new_group_obj)
+                    if new_group_obj.id not in st.session_state.active_group_ids:
+                        st.session_state.active_group_ids = st.session_state.active_group_ids + [new_group_obj.id]
+                    st.session_state.new_candidate_group_name = ""
+                else:
+                    st.error("Group name cannot be empty")
+
+            if custom_groups:
+                for group in custom_groups:
+                    is_active = group.id in st.session_state.active_group_ids
+                    group_container = st.container()
+                    with group_container:
+                        group_col1, group_col2, group_col3, group_col4, group_col5 = st.columns([4.4, 1.1, 1.1, 0.8, 0.8])
+                        with group_col1:
+                            st.markdown(f"""
+                                <div class="group-container">
+                                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                                        <div style="font-weight: 600;">{group.name}</div>
+                                    </div>
+                                    <div class="group-description">{group.description or ''}</div>
+                                    <div style="display: flex; flex-wrap: wrap; gap: 4px;">
+                                        {''.join([f'<span class="head-button" style="background-color: {group.color or COLOR_PALETTE[group.id % len(COLOR_PALETTE)]}">{head.layer},{head.head}</span>' for head in group.heads])}
+                                    </div>
+                                </div>
+                            """, unsafe_allow_html=True)
+                        with group_col2:
+                            button_label = "Hide" if is_active else "Show"
+                            if st.button(button_label, key=f"toggle_custom_group_{group.id}", type="primary" if not is_active else "secondary"):
+                                if is_active:
+                                    st.session_state.active_group_ids = [active_id for active_id in st.session_state.active_group_ids if active_id != group.id]
+                                else:
+                                    st.session_state.active_group_ids = st.session_state.active_group_ids + [group.id]
+                        with group_col3:
+                            if st.button("Refresh", key=f"refresh_group_{group.id}"):
+                                group.heads = get_unique_head_pairs(st.session_state.selected_heads)
+                        with group_col4:
+                            if st.button("🎨", key=f"color_custom_{group.id}", help="Change group color"):
+                                group.color = get_random_color()
+                        with group_col5:
+                            if st.button("×", key=f"remove_group_{group.id}", help="Remove group"):
+                                st.session_state.head_groups = [g for g in st.session_state.head_groups if g.id != group.id]
+                                st.session_state.active_group_ids = [active_id for active_id in st.session_state.active_group_ids if active_id != group.id]
+            else:
+                st.info("Save selected heads as a candidate group once you find a promising route.")
 
         with col2:
             st.subheader("Individual Heads")            
@@ -1378,45 +2185,49 @@ def main():
             def add_head(head_input: str) -> None:
                 if not head_input.strip():
                     return
-
-                if st.session_state.attention_data is None:
-                    st.error("Load attention data first by processing text or using sample data.")
-                    return
                     
                 try:
+                    num_layers, num_heads = get_model_dimensions(
+                        st.session_state.current_model,
+                        st.session_state.attention_data,
+                    )
+                    if num_layers <= 0 or num_heads <= 0:
+                        st.error("Could not determine model dimensions for head selection.")
+                        return
+
                     layer_str, head_str = head_input.split(',')
                     layer_str = layer_str.strip()
                     head_str = head_str.strip()
                     
                     if layer_str == ':' and head_str == ':':
-                        for l in range(st.session_state.attention_data['numLayers']):
-                            for h in range(st.session_state.attention_data['numHeads']):
+                        for l in range(num_layers):
+                            for h in range(num_heads):
                                 # Generate a consistent grey color for wildcard heads
-                                grey_value = 128 + ((l * st.session_state.attention_data['numHeads'] + h) * 20) % 96
+                                grey_value = 128 + ((l * num_heads + h) * 20) % 96
                                 grey_hex = f"#{grey_value:02x}{grey_value:02x}{grey_value:02x}"
                                 st.session_state.selected_heads.append(HeadPair(layer=l, head=h, color=grey_hex))
                     elif layer_str == ':':
                         head = int(head_str)
-                        if not 0 <= head < st.session_state.attention_data['numHeads']:
-                            st.error(f"Invalid head number. Must be between 0 and {st.session_state.attention_data['numHeads']-1}")
+                        if not 0 <= head < num_heads:
+                            st.error(f"Invalid head number. Must be between 0 and {num_heads-1}")
                             return
-                        for l in range(st.session_state.attention_data['numLayers']):
+                        for l in range(num_layers):
                             st.session_state.selected_heads.append(HeadPair(layer=l, head=head, color=COLOR_PALETTE[head % len(COLOR_PALETTE)]))
                     elif head_str == ':':
                         layer = int(layer_str)
-                        if not 0 <= layer < st.session_state.attention_data['numLayers']:
-                            st.error(f"Invalid layer number. Must be between 0 and {st.session_state.attention_data['numLayers']-1}")
+                        if not 0 <= layer < num_layers:
+                            st.error(f"Invalid layer number. Must be between 0 and {num_layers-1}")
                             return
-                        for h in range(st.session_state.attention_data['numHeads']):
+                        for h in range(num_heads):
                             st.session_state.selected_heads.append(HeadPair(layer=layer, head=h, color=COLOR_PALETTE[h % len(COLOR_PALETTE)]))
                     else:
                         layer = int(layer_str)
                         head = int(head_str)
-                        if not 0 <= layer < st.session_state.attention_data['numLayers']:
-                            st.error(f"Invalid layer number. Must be between 0 and {st.session_state.attention_data['numLayers']-1}")
+                        if not 0 <= layer < num_layers:
+                            st.error(f"Invalid layer number. Must be between 0 and {num_layers-1}")
                             return
-                        if not 0 <= head < st.session_state.attention_data['numHeads']:
-                            st.error(f"Invalid head number. Must be between 0 and {st.session_state.attention_data['numHeads']-1}")
+                        if not 0 <= head < num_heads:
+                            st.error(f"Invalid head number. Must be between 0 and {num_heads-1}")
                             return
                         st.session_state.selected_heads.append(HeadPair(layer=layer, head=head, color=COLOR_PALETTE[head % len(COLOR_PALETTE)]))
                     
@@ -1482,6 +2293,14 @@ def main():
         value=st.session_state.threshold,
         step=0.01
     )
+    st.session_state.attention_top_k = st.number_input(
+        "Max Edges per Head",
+        min_value=1,
+        max_value=100,
+        value=st.session_state.attention_top_k,
+        step=1,
+        help="The backend keeps only the strongest edges per visible head after applying the weight threshold."
+    )
     
     # Add curve type selector
     curve_types = {
@@ -1503,10 +2322,47 @@ def main():
         index=list(curve_types.keys()).index(current_display)
     )
     st.session_state.curve_type = curve_types[selected_display]
+
+    graph_view_modes = ["Attention weights", "Max clean-corrupted logit diff"]
+    st.session_state.graph_view_mode = st.selectbox(
+        "Graph Variant",
+        options=graph_view_modes,
+        index=graph_view_modes.index(st.session_state.graph_view_mode)
+        if st.session_state.graph_view_mode in graph_view_modes else 0,
+        help="The causal variant picks the head with the largest clean-corrupted logit-diff contribution at one layer and token position."
+    )
+
+    if st.session_state.graph_view_mode == "Max clean-corrupted logit diff":
+        build_disabled = (
+            not st.session_state.backend_available
+            or not st.session_state.input_text.strip()
+            or not st.session_state.corrupted_input_text.strip()
+        )
+        target_position = max(((st.session_state.attention_data or {}).get("numTokens", 1)) - 1, 0)
+        st.session_state.causal_top_heads_per_layer = st.number_input(
+            "Important heads per layer",
+            min_value=1,
+            max_value=8,
+            value=int(st.session_state.causal_top_heads_per_layer),
+            step=1,
+        )
+        st.caption(
+            f"This variant scans all layers at the final visible position ({target_position}) and keeps the strongest heads in each layer."
+        )
+        if st.button("Build Clean-Corrupted Graph", disabled=build_disabled):
+            try:
+                fetch_max_logit_diff_graph(force=True)
+            except Exception as e:
+                st.error(f"Error building clean-corrupted graph: {str(e)}")
+        if not st.session_state.backend_available:
+            st.caption("This graph variant requires a live backend.")
+        elif not st.session_state.corrupted_input_text.strip():
+            st.caption("Add a corrupted prompt to enable this graph variant.")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Text input and processing
-    if st.session_state.backend_available:
+    if st.session_state.analysis_source == "Single prompt" and st.session_state.backend_available:
         st.text_input(
             "Input Text",
             key="input_text"
@@ -1515,24 +2371,30 @@ def main():
         col1, col2 = st.columns([1, 5])
         with col1:
             if st.button("Process Text", type="primary"):
-                st.session_state.loading = True
                 try:
-                    st.session_state.attention_data = st.session_state.api_service.process_text(
-                        st.session_state.input_text,
-                        st.session_state.current_model
-                    )
+                    fetch_attention_data(force=True)
                     st.session_state.evaluation_result = None
+                    st.session_state.causal_graph_data = None
+                    st.session_state.causal_graph_signature = None
                 except Exception as e:
                     st.error(f"Error processing text: {str(e)}")
-                finally:
-                    st.session_state.loading = False
-    else:
+    elif st.session_state.analysis_source == "Single prompt":
         st.text_input(
             "Input Text",
             key="input_text",
             disabled=True,
             help="Text input is disabled when using sample data. Please start the backend server to enable text processing."
         )
+
+    if (
+        st.session_state.analysis_source == "Single prompt"
+        and st.session_state.backend_available
+        and st.session_state.attention_data is not None
+    ):
+        try:
+            fetch_attention_data(force=False)
+        except Exception as e:
+            st.error(f"Error refreshing attention data: {str(e)}")
 
     insight_col, intervention_col = st.columns([1.45, 1])
     with insight_col:
@@ -1578,8 +2440,11 @@ def main():
             else:
                 st.info("No head groups are available yet.")
         elif intervention_target == "All heads in layer":
-            max_source_layer = max((st.session_state.attention_data or {}).get("numLayers", 1) - 1, 0)
-            layer_options = list(range(max_source_layer))
+            model_layers, _ = get_model_dimensions(
+                st.session_state.current_model,
+                st.session_state.attention_data,
+            )
+            layer_options = list(range(model_layers))
             if layer_options:
                 if st.session_state.selected_layer_for_ablation not in layer_options:
                     st.session_state.selected_layer_for_ablation = layer_options[0]
@@ -1593,32 +2458,42 @@ def main():
         ablation_heads = get_ablation_heads(
             intervention_target,
             st.session_state.selected_heads,
-            st.session_state.head_groups,
+            get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids),
             ablation_group_name,
             ablation_layer,
             st.session_state.attention_data,
         )
         st.caption(f"Ablation set size: {len(ablation_heads)} heads")
 
-        compare_disabled = (not st.session_state.backend_available) or (len(ablation_heads) == 0)
+        compare_disabled = (
+            (not st.session_state.backend_available)
+            or (len(ablation_heads) == 0)
+            or (st.session_state.analysis_source == "Dataset" and not st.session_state.selected_dataset_name)
+        )
         if st.button("Run Causal Compare", type="primary", disabled=compare_disabled):
             try:
-                st.session_state.evaluation_result = st.session_state.api_service.evaluate_text(
-                    text=st.session_state.input_text,
-                    model=st.session_state.current_model,
-                    target_token=st.session_state.target_token,
-                    ablated_heads=[{"layer": head.layer, "head": head.head} for head in ablation_heads],
-                )
-                if st.session_state.attention_data is None:
-                    st.session_state.attention_data = st.session_state.api_service.process_text(
-                        st.session_state.input_text,
-                        st.session_state.current_model
+                if st.session_state.analysis_source == "Dataset":
+                    st.session_state.dataset_evaluation_result = st.session_state.api_service.evaluate_dataset(
+                        dataset_name=st.session_state.selected_dataset_name,
+                        model=st.session_state.current_model,
+                        ablated_heads=[{"layer": head.layer, "head": head.head} for head in ablation_heads],
                     )
+                else:
+                    st.session_state.evaluation_result = st.session_state.api_service.evaluate_text(
+                        text=st.session_state.input_text,
+                        model=st.session_state.current_model,
+                        target_token=st.session_state.target_token,
+                        ablated_heads=[{"layer": head.layer, "head": head.head} for head in ablation_heads],
+                    )
+                    if st.session_state.attention_data is None:
+                        fetch_attention_data(force=True)
             except Exception as e:
                 st.error(f"Error running causal compare: {str(e)}")
 
         if not st.session_state.backend_available:
             st.caption("Causal compare requires a live backend.")
+        elif st.session_state.analysis_source == "Dataset" and not st.session_state.selected_dataset_name:
+            st.caption("Choose a dataset before running batch causal compare.")
         elif len(ablation_heads) == 0:
             st.caption("Select at least one head, group, or layer before running ablation.")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1650,6 +2525,12 @@ def main():
                 "Diff": format_metric_value(diff_metrics.get("logit_diff_delta")) if diff_metrics else "n/a",
             },
             {
+                "Metric": "Correct token rank",
+                "Baseline": format_int_metric(baseline_metrics.get("target_rank")) if baseline_metrics else "n/a",
+                "Ablated": format_int_metric(ablated_metrics.get("target_rank")) if ablated_metrics else "n/a",
+                "Diff": format_int_metric(diff_metrics.get("target_rank_delta")) if diff_metrics else "n/a",
+            },
+            {
                 "Metric": "Loss",
                 "Baseline": format_metric_value(baseline_metrics.get("loss")) if baseline_metrics else "n/a",
                 "Ablated": format_metric_value(ablated_metrics.get("loss")) if ablated_metrics else "n/a",
@@ -1667,9 +2548,45 @@ def main():
             st.dataframe(pd.DataFrame(top_tokens), use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
+    if st.session_state.dataset_evaluation_result:
+        dataset_result = st.session_state.dataset_evaluation_result
+        aggregate = dataset_result.get("aggregate", {})
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-title">Dataset Comparison</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-copy">Aggregate causal metrics across the selected dataset. This is the batch view for identifying heads that matter consistently rather than on a single prompt.</div>',
+            unsafe_allow_html=True
+        )
+        aggregate_rows = [
+            {"Metric": "Mean target probability delta", "Value": format_metric_value(aggregate.get("mean_target_probability_delta"))},
+            {"Metric": "Mean logit diff delta", "Value": format_metric_value(aggregate.get("mean_logit_diff_delta"))},
+            {"Metric": "Mean correct-token rank delta", "Value": format_metric_value(aggregate.get("mean_rank_delta"))},
+            {"Metric": "Mean loss delta", "Value": format_metric_value(aggregate.get("mean_loss_delta"))},
+            {"Metric": "Top prediction changed fraction", "Value": format_metric_value(aggregate.get("top_prediction_changed_fraction"))},
+        ]
+        st.dataframe(pd.DataFrame(aggregate_rows), use_container_width=True, hide_index=True)
+
+        example_rows = []
+        for example in dataset_result.get("examples", [])[:20]:
+            delta = example.get("delta") or {}
+            example_rows.append(
+                {
+                    "Example": example.get("example_id"),
+                    "Target prob delta": delta.get("target_probability_delta"),
+                    "Logit diff delta": delta.get("logit_diff_delta"),
+                    "Rank delta": delta.get("target_rank_delta"),
+                    "Loss delta": delta.get("loss_delta"),
+                    "Prediction changed": delta.get("top_prediction_changed"),
+                }
+            )
+        if example_rows:
+            st.caption("Per-example results preview")
+            st.dataframe(pd.DataFrame(example_rows), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
     inspector_options = build_head_inspector_options(
         st.session_state.selected_heads,
-        st.session_state.head_groups
+        get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids)
     )
     if inspector_options:
         valid_keys = [option[1] for option in inspector_options]
@@ -1696,7 +2613,7 @@ def main():
                 st.session_state.attention_data,
                 st.session_state.threshold,
                 st.session_state.selected_heads,
-                st.session_state.head_groups,
+                get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids),
                 st.session_state.inspector_head_key
             )
             if head_summary:
@@ -1719,10 +2636,6 @@ def main():
     with hypothesis_col:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.markdown('<div class="panel-title">Hypothesis Checklist</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="panel-copy">A compact research checklist keeps the graph anchored to mechanistic questions instead of turning into an attention tour.</div>',
-            unsafe_allow_html=True
-        )
         checklist_items = [
             "Which source token appears to feed the answer-relevant position?",
             "Does the candidate route stay stable when you raise the threshold?",
@@ -1739,22 +2652,29 @@ def main():
         
         try:
             logger.info("Starting graph creation")
-            # Log the attention data structure
-            logger.info("Attention data structure: " + json.dumps({
-                'numLayers': st.session_state.attention_data['numLayers'],
-                'numTokens': st.session_state.attention_data['numTokens'],
-                'numHeads': st.session_state.attention_data['numHeads'],
-                'numPatterns': len(st.session_state.attention_data['attentionPatterns']),
-                'hasTokens': 'tokens' in st.session_state.attention_data
-            }, indent=2))
-            
-            # Create and display the graph
-            create_attention_graph(
-                st.session_state.attention_data,
-                st.session_state.threshold,
-                st.session_state.selected_heads,
-                st.session_state.head_groups
-            )
+            if st.session_state.graph_view_mode == "Max clean-corrupted logit diff":
+                if st.session_state.causal_graph_data and causal_graph_matches_current_state():
+                    create_max_logit_diff_graph(st.session_state.causal_graph_data)
+                    important_heads_frame = build_important_heads_frame(st.session_state.causal_graph_data)
+                    if not important_heads_frame.empty:
+                        st.caption("Important heads in each layer at the final position")
+                        st.dataframe(important_heads_frame, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Build the clean-corrupted graph to inspect important heads in each layer at the final token position.")
+            else:
+                logger.info("Attention data structure: " + json.dumps({
+                    'numLayers': st.session_state.attention_data['numLayers'],
+                    'numTokens': st.session_state.attention_data['numTokens'],
+                    'numHeads': st.session_state.attention_data['numHeads'],
+                    'numPatterns': get_attention_pattern_count(st.session_state.attention_data),
+                    'hasTokens': 'tokens' in st.session_state.attention_data
+                }, indent=2))
+                create_attention_graph(
+                    st.session_state.attention_data,
+                    st.session_state.threshold,
+                    st.session_state.selected_heads,
+                    get_active_head_groups(st.session_state.head_groups, st.session_state.active_group_ids)
+                )
         except Exception as e:
             logger.error(f"Error creating graph: {str(e)}", exc_info=True)
             st.error(f"Error creating graph: {str(e)}")
